@@ -891,6 +891,9 @@ def get_snapshot_stats():
         ).fetchone()
         return {"total_rows": row[0], "distinct_dates": row[1], "distinct_stocks": row[2],
                 "latest_date": row[3], "earliest_date": row[4]}
+    except sqlite3.OperationalError:
+        # 資料庫檔案存在，但 snapshots 表還沒建立（還沒跑過第一次快照掃描）
+        return None
     finally:
         conn.close()
 
