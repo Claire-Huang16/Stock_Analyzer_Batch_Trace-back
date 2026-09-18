@@ -311,22 +311,30 @@ def build_price_month_avg_map(data):
 
 
 def compute_divergence_asof(rev_map: dict, price_month_avg_map: dict, eval_date_str: str):
-    """算某個評估日『當下』能看到的近3月營收YoY vs 均價YoY 乖離度加總（近3月合計）。
-    只用 as_of 當天已公告的月份，年增率的去年同月比較資料不存在就跳過那個月。"""
+    """算某個評估日『當下』能看到的近3月營收YoY vs 均價YoY 乖離度加總（近3月合計），
+    同時回傳單獨的股價YoY加總（不跟營收相減）——乖離度看的是『營收跟股價有沒有
+    脫節』，股價YoY單獨看的是『股價本身年增率強不強』，是兩件不同的事，不該只看
+    合併後的差值，所以兩個都回傳，讓呼叫端可以分開當條件用。
+    只用 as_of 當天已公告的月份，年增率的去年同月比較資料不存在就跳過那個月。
+    回傳 (div_total, price_yoy_total)，都可能是 None。"""
     months = _last_n_known_months(eval_date_str, 3)
     if not months:
-        return None
-    total, any_valid = 0.0, False
+        return None, None
+    div_total, price_yoy_total = 0.0, 0.0
+    any_valid, any_price_valid = False, False
     for (y, m) in months:
         rev_this, rev_last = rev_map.get((y, m)), rev_map.get((y - 1, m))
         px_this, px_last = price_month_avg_map.get((y, m)), price_month_avg_map.get((y - 1, m))
+        if px_last and px_this is not None:
+            price_yoy_total += (px_this - px_last) / px_last * 100
+            any_price_valid = True
         if not rev_last or rev_this is None or not px_last or px_this is None:
             continue
         rev_yoy = (rev_this - rev_last) / rev_last * 100
         px_yoy = (px_this - px_last) / px_last * 100
-        total += (rev_yoy - px_yoy)
+        div_total += (rev_yoy - px_yoy)
         any_valid = True
-    return total if any_valid else None
+    return (div_total if any_valid else None), (price_yoy_total if any_price_valid else None)
 
 
 def compute_inst_3m_asof(inst_daily_map: dict, eval_date_str: str):
@@ -900,6 +908,7 @@ def compute_core_signals(data, dm):
     macd_state = None
     is_breakout = False
     is_pullback_rebound = False
+    golden_cross_recent = False
     if (last.get("macd") is not None and last.get("macdSig") is not None
             and last.get("macdHist") is not None and prev.get("macdHist") is not None):
         above_zero = last["macd"] > 0
@@ -911,7 +920,6 @@ def compute_core_signals(data, dm):
         else:
             macd_state = "交叉轉換中"
 
-        golden_cross_recent = False
         for gci in range(max(1, len(data) - 3), len(data)):
             gc_cur, gc_prev = data[gci], data[gci - 1]
             if (gc_cur.get("macd") is not None and gc_cur.get("macdSig") is not None
@@ -945,7 +953,8 @@ def compute_core_signals(data, dm):
         is_pullback_rebound = bb_pos is not None and bb_pos <= 20 and divergence_detected and golden_cross_recent
 
     return {"bb_pos": bb_pos, "macd_state": macd_state,
-            "is_breakout": is_breakout, "is_pullback_rebound": is_pullback_rebound}
+            "is_breakout": is_breakout, "is_pullback_rebound": is_pullback_rebound,
+            "golden_cross_recent": golden_cross_recent}
 
 
 # ────────────────────────────────────────────────────────────────
@@ -1101,9 +1110,12 @@ def init_backtest_table():
     for col_def in [
         "pattern_formed INTEGER",
         "pattern_breakout INTEGER",
+        "pattern_just_broke INTEGER",
         "pb_all_pass INTEGER",
         "div_total REAL",
+        "price_yoy_3m REAL",
         "inst_3m REAL",
+        "golden_cross_recent INTEGER",
     ]:
         try:
             conn.execute(f"ALTER TABLE backtest_evals ADD COLUMN {col_def}")
@@ -1198,15 +1210,16 @@ def run_historical_backtest(token: str, months_back: int = 3, include_pattern: b
                 dm = score_dmi(dmi)
                 sig = compute_core_signals(data_slice, dm)
 
-                pattern_formed, pattern_breakout, pb_all_pass = None, None, None
+                pattern_formed, pattern_breakout, pattern_just_broke, pb_all_pass = None, None, None, None
                 if include_pattern:
                     pb = check_pullback_buy(data_slice)
                     pt = detect_patterns(data_slice, pb)
                     pattern_formed = int(pt["anyFormed"])
                     pattern_breakout = int(pt["anyBreakout"])
+                    pattern_just_broke = int(pt["anyJustBroke"])
                     pb_all_pass = int(pb["allPass"])
 
-                div_total = compute_divergence_asof(rev_map, price_month_avg_map, eval_date) if include_div else None
+                div_total, price_yoy_3m = compute_divergence_asof(rev_map, price_month_avg_map, eval_date) if include_div else (None, None)
                 inst_3m = compute_inst_3m_asof(inst_daily_map, eval_date) if include_inst else None
 
                 entry_close = data[idx]["close"]
@@ -1220,13 +1233,15 @@ def run_historical_backtest(token: str, months_back: int = 3, include_pattern: b
                     INSERT OR REPLACE INTO backtest_evals
                     (eval_date, stock_id, name, score, plus_di, minus_di, adx, adxr, bb_pos,
                      is_breakout, is_pullback_rebound, entry_close, ret_5d, ret_10d, ret_20d,
-                     pattern_formed, pattern_breakout, pb_all_pass, div_total, inst_3m, created_at)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                     pattern_formed, pattern_breakout, pattern_just_broke, pb_all_pass,
+                     div_total, price_yoy_3m, inst_3m, golden_cross_recent, created_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """, (
                     eval_date, sid, name, dm["score"], dm["plusDI"], dm["minusDI"], dm["adx"], dm["adxr"],
                     sig["bb_pos"], int(sig["is_breakout"]), int(sig["is_pullback_rebound"]), entry_close,
                     rets[5], rets[10], rets[20],
-                    pattern_formed, pattern_breakout, pb_all_pass, div_total, inst_3m,
+                    pattern_formed, pattern_breakout, pattern_just_broke, pb_all_pass,
+                    div_total, price_yoy_3m, inst_3m, int(sig["golden_cross_recent"]),
                     datetime.now().isoformat(timespec="seconds"),
                 ))
                 saved_rows += 1
@@ -1360,16 +1375,23 @@ def build_condition_flags(df: pd.DataFrame) -> pd.DataFrame:
     flags["跌深反彈盤"] = d["is_pullback_rebound"] == 1
     flags["布林通道低檔(≤20%)"] = d["bb_pos"] <= 20
     flags["布林通道高檔(≥80%)"] = d["bb_pos"] >= 80
+    if "golden_cross_recent" in d.columns and d["golden_cross_recent"].notna().any():
+        flags["MACD近3日內黃金交叉"] = d["golden_cross_recent"] == 1
 
     if "pattern_formed" in d.columns and d["pattern_formed"].notna().any():
         flags["型態成形中"] = d["pattern_formed"] == 1
     if "pattern_breakout" in d.columns and d["pattern_breakout"].notna().any():
         flags["型態突破確認"] = d["pattern_breakout"] == 1
+    if "pattern_just_broke" in d.columns and d["pattern_just_broke"].notna().any():
+        flags["型態剛形成(剛突破)"] = d["pattern_just_broke"] == 1
     if "pb_all_pass" in d.columns and d["pb_all_pass"].notna().any():
         flags["回後買上漲全通過"] = d["pb_all_pass"] == 1
     if "div_total" in d.columns and d["div_total"].notna().any():
         flags["近3月乖離度為正(營收優於股價)"] = d["div_total"] > 0
         flags["近3月乖離度為負(股價超前營收)"] = d["div_total"] < 0
+    if "price_yoy_3m" in d.columns and d["price_yoy_3m"].notna().any():
+        flags["近3月均價YoY為正"] = d["price_yoy_3m"] > 0
+        flags["近3月均價YoY為負"] = d["price_yoy_3m"] < 0
     if "inst_3m" in d.columns and d["inst_3m"].notna().any():
         flags["三大法人近3月買超"] = d["inst_3m"] > 0
         flags["三大法人近3月賣超"] = d["inst_3m"] < 0
@@ -2543,17 +2565,19 @@ with st.sidebar:
             else:
                 run_full_market_snapshot(api_token)
 
-    with st.expander("🔬 歷史回測分析（過去3個月，事後驗證＋參數優化）"):
+    with st.expander("🔬 歷史回測分析（事後驗證＋參數優化）"):
+        months_back_bt = st.number_input("回測天數（月）", min_value=1, max_value=12, value=3, step=1, key="bt_months_back")
         st.caption(
-            "回溯過去3個月，用「上市清單」重新計算每個交易日『當時』的DMI/多方力道評分"
+            "回溯過去N個月，用「上市清單」重新計算每個交易日『當時』的DMI/多方力道評分"
             "（只用當天以前的資料，沒有偷看未來），對照5/10/20個交易日後的實際報酬，"
-            "驗證現有評分公式準不準，並試算不同參數組合的效果。全市場規模預估需要"
-            "15-25分鐘，過程中請勿切換分頁或關閉視窗。分析結果會顯示在右側主畫面。"
+            "驗證現有評分公式準不準，並試算不同參數組合的效果。月數愈大，全市場規模跑"
+            "的時間愈長（3個月約15-25分鐘，等比例往上抓），過程中請勿切換分頁或關閉視窗。"
+            "分析結果會顯示在右側主畫面。"
         )
         st.caption("型態確認、回後買上漲不需要額外API，一律會記錄。以下兩項各自要多抓一組資料，會拉長時間：")
         include_div_bt = st.checkbox("📈 近3月YoY乖離度（需要超過1年的股價歷史，明顯拉長抓取時間）", value=False, key="bt_include_div")
         include_inst_bt = st.checkbox("🏦 三大法人買賣超（近3月）", value=False, key="bt_include_inst")
-        backtest_clicked = st.button("🔬 執行歷史回測（過去3個月）", use_container_width=True)
+        backtest_clicked = st.button("🔬 執行歷史回測", use_container_width=True)
 
     top100_clicked = st.button("🔥 漲幅前100分析", use_container_width=True)
     if top100_clicked:
@@ -2713,7 +2737,7 @@ if backtest_clicked:
     if not api_token:
         st.error("請輸入 FinMind API Token")
     else:
-        run_historical_backtest(api_token, months_back=3,
+        run_historical_backtest(api_token, months_back=int(months_back_bt),
                                  include_div=include_div_bt, include_inst=include_inst_bt)
 
 bt_df = load_backtest_df()
@@ -2734,9 +2758,17 @@ if bt_df is not None and not bt_df.empty:
     st.markdown("##### 🎯 「跌深反彈盤」標記 vs 實際報酬")
     st.dataframe(analyze_tag_hitrate(bt_df, "is_pullback_rebound", "跌深反彈盤"), hide_index=True, use_container_width=True)
 
+    if "golden_cross_recent" in bt_df.columns and bt_df["golden_cross_recent"].notna().any():
+        st.markdown("##### ⚡ 「MACD近3日內黃金交叉」標記 vs 實際報酬")
+        st.dataframe(analyze_tag_hitrate(bt_df, "golden_cross_recent", "MACD黃金交叉"), hide_index=True, use_container_width=True)
+
     if "pattern_breakout" in bt_df.columns and bt_df["pattern_breakout"].notna().any():
         st.markdown("##### 🔍 「型態突破確認」標記 vs 實際報酬")
         st.dataframe(analyze_tag_hitrate(bt_df, "pattern_breakout", "型態突破確認"), hide_index=True, use_container_width=True)
+
+    if "pattern_just_broke" in bt_df.columns and bt_df["pattern_just_broke"].notna().any():
+        st.markdown("##### 🔥 「型態剛形成(剛突破)」標記 vs 實際報酬")
+        st.dataframe(analyze_tag_hitrate(bt_df, "pattern_just_broke", "型態剛形成"), hide_index=True, use_container_width=True)
 
     if "pb_all_pass" in bt_df.columns and bt_df["pb_all_pass"].notna().any():
         st.markdown("##### ✅ 「回後買上漲全通過」標記 vs 實際報酬")
