@@ -16,6 +16,7 @@ import json
 import os
 import io
 import sqlite3
+import itertools
 from datetime import datetime, timedelta
 
 import numpy as np
@@ -227,6 +228,120 @@ def fetch_institutional_monthly(stock_id: str, token: str):
         y, m = (int(p) for p in key.split("-"))
         result.append({"year": y, "month": m, "net": month_map[key]})
     return result
+
+
+# ────────────────────────────────────────────────────────────────
+# 回測專用：長時間歷史版本的月營收／法人買賣超抓取，以及「當時已公告」的
+# 判斷邏輯（避免回測偷看未來才公告的資料）。
+# ────────────────────────────────────────────────────────────────
+
+def fetch_revenue_history_for_backtest(stock_id: str, token: str, days_back: int):
+    """回測用：抓長時間的月營收歷史（不是像 fetch_revenue_yoy_mom 只抓最近3個月），
+    用來支援對過去任意日期算YoY。回傳 dict {(year, month): revenue}。"""
+    end = datetime.today()
+    start = datetime.today() - timedelta(days=days_back)
+    fmt = "%Y-%m-%d"
+    url = f"{FINMIND_BASE}?dataset=TaiwanStockMonthRevenue&data_id={stock_id}&start_date={start.strftime(fmt)}&end_date={end.strftime(fmt)}&token={token}"
+    j = api_fetch(url)
+    rows = j.get("data") or []
+    rev_map = {}
+    for r in rows:
+        y, m = r.get("revenue_year"), r.get("revenue_month")
+        if y is None or m is None or r.get("revenue") is None:
+            continue
+        rev_map[(int(y), int(m))] = r["revenue"]
+    return rev_map
+
+
+def fetch_institutional_history_for_backtest(stock_id: str, token: str, days_back: int):
+    """回測用：抓長時間的每日三大法人買賣超歷史。回傳 dict {"YYYY-MM-DD": 當日淨買賣超}。"""
+    end = datetime.today()
+    start = datetime.today() - timedelta(days=days_back)
+    fmt = "%Y-%m-%d"
+    url = f"{FINMIND_BASE}?dataset=TaiwanStockInstitutionalInvestorsBuySell&data_id={stock_id}&start_date={start.strftime(fmt)}&end_date={end.strftime(fmt)}&token={token}"
+    j = api_fetch(url)
+    rows = j.get("data") or []
+    daily_net = {}
+    for r in rows:
+        d = str(r.get("date", ""))[:10]
+        if len(d) < 10:
+            continue
+        net = (float(r.get("buy") or 0)) - (float(r.get("sell") or 0))
+        daily_net[d] = daily_net.get(d, 0) + net
+    return daily_net
+
+
+def _revenue_known_by(year: int, month: int, as_of_date_str: str) -> bool:
+    """判斷 year年month月 的月營收，在 as_of_date_str 這天是不是已經依法公告
+    （台灣規定月營收要在次月10日前公告，這裡用次月10日當保守的『已知』門檻，
+    避免回測用到『當下根本還沒公告』的營收資料造成偷看未來）。"""
+    disclose_year, disclose_month = (year, month + 1) if month < 12 else (year + 1, 1)
+    disclose_date = datetime(disclose_year, disclose_month, 10)
+    as_of = datetime.strptime(as_of_date_str, "%Y-%m-%d")
+    return as_of >= disclose_date
+
+
+def _last_n_known_months(as_of_date_str: str, n: int = 3):
+    """回傳 as_of_date_str 當下『已公告』的最近n個月份 [(year,month), ...]（舊到新）。"""
+    as_of = datetime.strptime(as_of_date_str, "%Y-%m-%d")
+    result = []
+    y, m = as_of.year, as_of.month
+    for _ in range(18):  # 最多往前找18個月，避免極端情況下無限迴圈
+        if _revenue_known_by(y, m, as_of_date_str):
+            result.append((y, m))
+            if len(result) >= n:
+                break
+        m -= 1
+        if m < 1:
+            m, y = 12, y - 1
+    result.reverse()
+    return result
+
+
+def build_price_month_avg_map(data):
+    """把已經抓好的完整日K資料，依年月分組算平均收盤價，回傳 dict {(year,month): 均價}。
+    這樣算月均價YoY不用再多打一次API——直接沿用DMI計算已經抓到的長天期價格資料。"""
+    sums, counts = {}, {}
+    for d in data:
+        y, m = int(d["date"][:4]), int(d["date"][5:7])
+        key = (y, m)
+        sums[key] = sums.get(key, 0) + d["close"]
+        counts[key] = counts.get(key, 0) + 1
+    return {k: sums[k] / counts[k] for k in sums}
+
+
+def compute_divergence_asof(rev_map: dict, price_month_avg_map: dict, eval_date_str: str):
+    """算某個評估日『當下』能看到的近3月營收YoY vs 均價YoY 乖離度加總（近3月合計）。
+    只用 as_of 當天已公告的月份，年增率的去年同月比較資料不存在就跳過那個月。"""
+    months = _last_n_known_months(eval_date_str, 3)
+    if not months:
+        return None
+    total, any_valid = 0.0, False
+    for (y, m) in months:
+        rev_this, rev_last = rev_map.get((y, m)), rev_map.get((y - 1, m))
+        px_this, px_last = price_month_avg_map.get((y, m)), price_month_avg_map.get((y - 1, m))
+        if not rev_last or rev_this is None or not px_last or px_this is None:
+            continue
+        rev_yoy = (rev_this - rev_last) / rev_last * 100
+        px_yoy = (px_this - px_last) / px_last * 100
+        total += (rev_yoy - px_yoy)
+        any_valid = True
+    return total if any_valid else None
+
+
+def compute_inst_3m_asof(inst_daily_map: dict, eval_date_str: str):
+    """算eval_date_str往前3個月（約90天）的三大法人買賣超加總，只看eval_date_str
+    當天以前的資料（法人日買賣超本身沒有公告時間差的問題，跟月營收不同，直接抓
+    截至當天的歷史資料即可，不需要額外的『已知門檻』判斷）。"""
+    end = datetime.strptime(eval_date_str, "%Y-%m-%d")
+    start = end - timedelta(days=90)
+    total, any_valid = 0.0, False
+    for d_str, net in inst_daily_map.items():
+        d = datetime.strptime(d_str, "%Y-%m-%d")
+        if start <= d <= end:
+            total += net
+            any_valid = True
+    return total if any_valid else None
 
 
 def _last_n_calendar_months(n: int):
@@ -981,26 +1096,54 @@ def init_backtest_table():
             PRIMARY KEY (eval_date, stock_id)
         )
     """)
+    # 相容舊資料庫：用 ALTER TABLE 補新欄位，已存在就吃掉錯誤跳過
+    # （SQLite沒有 ADD COLUMN IF NOT EXISTS，只能用這種方式相容舊表）
+    for col_def in [
+        "pattern_formed INTEGER",
+        "pattern_breakout INTEGER",
+        "pb_all_pass INTEGER",
+        "div_total REAL",
+        "inst_3m REAL",
+    ]:
+        try:
+            conn.execute(f"ALTER TABLE backtest_evals ADD COLUMN {col_def}")
+        except sqlite3.OperationalError:
+            pass  # 欄位已存在
     conn.commit()
     return conn
 
 
-def run_historical_backtest(token: str, months_back: int = 3):
+def run_historical_backtest(token: str, months_back: int = 3, include_pattern: bool = True,
+                             include_div: bool = False, include_inst: bool = False):
     """回溯過去 months_back 個月，對每個交易日重新計算「當時」的DMI/評分/訊號
-    （只用當天以前的資料切片再丟進既有的 calc_dmi／score_dmi／compute_core_signals，
-    保證沒有偷看未來——這幾個函式本來就是「給一段資料、算出最後一天的訊號」，
-    直接重複利用，不用另外寫一套向量化版本冒index算錯的風險），然後對照
-    5/10/20天後的實際收盤價算出報酬率，存進 backtest_evals 表。
+    （只用當天以前的資料切片再丟進既有的 calc_dmi／score_dmi／compute_core_signals／
+    check_pullback_buy／detect_patterns，保證沒有偷看未來——這幾個函式本來就是
+    「給一段資料、算出最後一天的訊號」，直接重複利用，不用另外寫一套向量化版本
+    冒index算錯的風險），然後對照5/10/20天後的實際收盤價算出報酬率，存進
+    backtest_evals 表。
 
-    每檔股票抓約(3個月+60天技術指標暖身緩衝+20天事後驗證緩衝)的歷史，固定用
-    上市清單當樣本池。運算量本身很小（純迴圈，沒有額外API呼叫），真正花時間的
-    還是1,100多檔的價格資料抓取。
+    型態確認（型態辨識、回後買上漲）不需要額外API，直接免費算；近3月YoY乖離度
+    跟三大法人買賣超各自需要多抓一組歷史資料（營收／法人日買賣超），而且乖離度
+    要算YoY需要抓到超過一年的股價歷史，所以勾選這兩項時，每檔股票的抓取天數／
+    API呼叫次數都會明顯增加，整體時間可能拉長到原本的1.5-2倍。
+
+    月營收有『公告時間差』（法定次月10日前公告），這裡用 _revenue_known_by 嚴格只
+    採用『評估當天已經公告』的月份，避免回測偷看『當下還沒公告』的營收資料，這點
+    法人日買賣超沒有這個問題（每日資料，沒有公告延遲的疑慮）。
+
+    每檔股票固定用上市清單當樣本池。運算量本身很小（純迴圈，沒有額外API呼叫），
+    真正花時間的還是1,100多檔的資料抓取次數。
     """
     conn = init_backtest_table()
     name_map = fetch_stock_name_map(token)
     lookback_buffer = 60
     max_horizon = max(BACKTEST_HORIZONS)
-    fetch_days = months_back * 30 + lookback_buffer + max_horizon + 10
+    # 乖離度需要YoY比較（去年同月），所以價格歷史要抓到超過12個月，才能覆蓋
+    # 整個3個月評估窗內每一天回頭看「去年同月」的均價
+    price_fetch_days = (months_back * 30 + lookback_buffer + max_horizon + 10 + 400) if include_div \
+        else (months_back * 30 + lookback_buffer + max_horizon + 10)
+    revenue_fetch_days = months_back * 30 + 400  # 涵蓋YoY所需的前一年同期
+    inst_fetch_days = months_back * 30 + 100  # 3個月評估窗 + 每個評估點往前3個月的緩衝
 
     total = len(TWSE_LIST)
     progress_bar = st.progress(0)
@@ -1011,7 +1154,7 @@ def run_historical_backtest(token: str, months_back: int = 3):
     for i, sid in enumerate(TWSE_LIST):
         status.text(f"🔬 回測中：{sid}… ({i + 1}/{total})　已存 {saved_rows:,} 筆　失敗 {failed} 檔")
         try:
-            rows = fetch_price_data(sid, token, fetch_days)
+            rows = fetch_price_data(sid, token, price_fetch_days)
             raw_data = sorted(
                 [{"date": d["date"], "open": float(d["open"]), "high": float(d["max"]),
                   "low": float(d["min"]), "close": float(d["close"]), "volume": float(d["Trading_Volume"])}
@@ -1025,12 +1168,47 @@ def run_historical_backtest(token: str, months_back: int = 3):
             if eval_end <= eval_start:
                 failed += 1
                 continue
+
+            rev_map, price_month_avg_map = {}, {}
+            if include_div:
+                try:
+                    rev_map = fetch_revenue_history_for_backtest(sid, token, revenue_fetch_days)
+                    price_month_avg_map = build_price_month_avg_map(data)
+                except Exception:
+                    rev_map = {}  # 抓不到就這個標的的乖離度全部是None，不影響其他欄位
+
+            inst_daily_map = {}
+            if include_inst:
+                try:
+                    inst_daily_map = fetch_institutional_history_for_backtest(sid, token, inst_fetch_days)
+                except Exception:
+                    inst_daily_map = {}
+
             name = name_map.get(sid, sid)
+            # 限定只評估「最近 months_back 個月」範圍內的交易日（price_fetch_days
+            # 為了乖離度算YoY會抓超過一年，但評估窗本身還是只看最近3個月）
+            eval_window_start_date = (datetime.today() - timedelta(days=months_back * 30)).strftime("%Y-%m-%d")
+
             for idx in range(eval_start, eval_end):
+                eval_date = data[idx]["date"]
+                if eval_date < eval_window_start_date:
+                    continue
                 data_slice = data[:idx + 1]  # 只給「當時」以前的資料，不含未來
                 dmi = calc_dmi(data_slice, 14)
                 dm = score_dmi(dmi)
                 sig = compute_core_signals(data_slice, dm)
+
+                pattern_formed, pattern_breakout, pb_all_pass = None, None, None
+                if include_pattern:
+                    pb = check_pullback_buy(data_slice)
+                    pt = detect_patterns(data_slice, pb)
+                    pattern_formed = int(pt["anyFormed"])
+                    pattern_breakout = int(pt["anyBreakout"])
+                    pb_all_pass = int(pb["allPass"])
+
+                div_total = compute_divergence_asof(rev_map, price_month_avg_map, eval_date) if include_div else None
+                inst_3m = compute_inst_3m_asof(inst_daily_map, eval_date) if include_inst else None
+
                 entry_close = data[idx]["close"]
                 rets = {}
                 for h in BACKTEST_HORIZONS:
@@ -1041,12 +1219,15 @@ def run_historical_backtest(token: str, months_back: int = 3):
                 conn.execute("""
                     INSERT OR REPLACE INTO backtest_evals
                     (eval_date, stock_id, name, score, plus_di, minus_di, adx, adxr, bb_pos,
-                     is_breakout, is_pullback_rebound, entry_close, ret_5d, ret_10d, ret_20d, created_at)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                     is_breakout, is_pullback_rebound, entry_close, ret_5d, ret_10d, ret_20d,
+                     pattern_formed, pattern_breakout, pb_all_pass, div_total, inst_3m, created_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """, (
-                    data[idx]["date"], sid, name, dm["score"], dm["plusDI"], dm["minusDI"], dm["adx"], dm["adxr"],
+                    eval_date, sid, name, dm["score"], dm["plusDI"], dm["minusDI"], dm["adx"], dm["adxr"],
                     sig["bb_pos"], int(sig["is_breakout"]), int(sig["is_pullback_rebound"]), entry_close,
-                    rets[5], rets[10], rets[20], datetime.now().isoformat(timespec="seconds"),
+                    rets[5], rets[10], rets[20],
+                    pattern_formed, pattern_breakout, pb_all_pass, div_total, inst_3m,
+                    datetime.now().isoformat(timespec="seconds"),
                 ))
                 saved_rows += 1
             if (i + 1) % 20 == 0:
@@ -1160,6 +1341,78 @@ def grid_search_params(df: pd.DataFrame, target_horizon: int = 10):
     if result_df.empty:
         return result_df
     return result_df.sort_values(f"{target_horizon}日平均報酬%", ascending=False).head(15).reset_index(drop=True)
+
+
+# ────────────────────────────────────────────────────────────────
+# 多因子複選搜尋：把每一列資料轉成一組「條件旗標」（分數夠高、有突破盤標記、
+# 型態確認、布林通道位置、乖離度、法人買賣超…），然後窮舉1~3個條件的所有組合，
+# 看哪個組合的勝率/平均報酬最好。
+# ────────────────────────────────────────────────────────────────
+def build_condition_flags(df: pd.DataFrame) -> pd.DataFrame:
+    """把原始欄位轉成一組True/False條件旗標，供複選搜尋窮舉組合用。哪些旗標會
+    出現取決於這次回測有沒有收集對應欄位（乖離度／法人買賣超是可選的，型態確認
+    理論上一定有，但相容舊資料庫可能是空值，一併防呆）。"""
+    d = df.copy()
+    flags = {}
+    flags["多方力道≥65"] = d["score"] >= 65
+    flags["多方力道≥80"] = d["score"] >= 80
+    flags["強勢突破盤"] = d["is_breakout"] == 1
+    flags["跌深反彈盤"] = d["is_pullback_rebound"] == 1
+    flags["布林通道低檔(≤20%)"] = d["bb_pos"] <= 20
+    flags["布林通道高檔(≥80%)"] = d["bb_pos"] >= 80
+
+    if "pattern_formed" in d.columns and d["pattern_formed"].notna().any():
+        flags["型態成形中"] = d["pattern_formed"] == 1
+    if "pattern_breakout" in d.columns and d["pattern_breakout"].notna().any():
+        flags["型態突破確認"] = d["pattern_breakout"] == 1
+    if "pb_all_pass" in d.columns and d["pb_all_pass"].notna().any():
+        flags["回後買上漲全通過"] = d["pb_all_pass"] == 1
+    if "div_total" in d.columns and d["div_total"].notna().any():
+        flags["近3月乖離度為正(營收優於股價)"] = d["div_total"] > 0
+        flags["近3月乖離度為負(股價超前營收)"] = d["div_total"] < 0
+    if "inst_3m" in d.columns and d["inst_3m"].notna().any():
+        flags["三大法人近3月買超"] = d["inst_3m"] > 0
+        flags["三大法人近3月賣超"] = d["inst_3m"] < 0
+
+    flag_df = pd.DataFrame(flags, index=d.index)
+    return pd.concat([d, flag_df], axis=1), list(flags.keys())
+
+
+def combo_search(df: pd.DataFrame, target_horizon: int = 10, max_combo_size: int = 3,
+                  min_samples: int = 50, top_n: int = 20):
+    """窮舉1~max_combo_size個條件旗標的AND組合，看哪個組合對N天後報酬的判斷力
+    最好。組合數會隨旗標數量跟max_combo_size快速增加（這是多重比較，測試的組合
+    越多，純粹運氣好而表現突出的組合也會越多，不是每個排前面的組合都代表真的
+    有效——樣本數門檻（min_samples）是用來過濾掉「條件太嚴苛、樣本太少」的組合，
+    但無法完全排除多重比較造成的偽陽性，結果僅供參考方向）。"""
+    d, flag_names = build_condition_flags(df)
+    ret_col = f"ret_{target_horizon}d"
+    valid = d.dropna(subset=[ret_col])
+    if valid.empty or not flag_names:
+        return pd.DataFrame(), 0
+
+    results = []
+    combos_tested = 0
+    for size in range(1, max_combo_size + 1):
+        for combo in itertools.combinations(flag_names, size):
+            mask = valid[list(combo)].all(axis=1)
+            combos_tested += 1
+            n_match = int(mask.sum())
+            if n_match < min_samples:
+                continue
+            rets = valid.loc[mask, ret_col]
+            results.append({
+                "條件組合": " ＋ ".join(combo),
+                "條件數": size,
+                "樣本數": n_match,
+                f"{target_horizon}日平均報酬%": round(rets.mean(), 2),
+                f"{target_horizon}日勝率%": round((rets > 0).mean() * 100, 1),
+            })
+    result_df = pd.DataFrame(results)
+    if result_df.empty:
+        return result_df, combos_tested
+    result_df = result_df.sort_values(f"{target_horizon}日平均報酬%", ascending=False).head(top_n).reset_index(drop=True)
+    return result_df, combos_tested
 
 
 # ────────────────────────────────────────────────────────────────
@@ -2295,45 +2548,12 @@ with st.sidebar:
             "回溯過去3個月，用「上市清單」重新計算每個交易日『當時』的DMI/多方力道評分"
             "（只用當天以前的資料，沒有偷看未來），對照5/10/20個交易日後的實際報酬，"
             "驗證現有評分公式準不準，並試算不同參數組合的效果。全市場規模預估需要"
-            "15-25分鐘，過程中請勿切換分頁或關閉視窗。"
+            "15-25分鐘，過程中請勿切換分頁或關閉視窗。分析結果會顯示在右側主畫面。"
         )
+        st.caption("型態確認、回後買上漲不需要額外API，一律會記錄。以下兩項各自要多抓一組資料，會拉長時間：")
+        include_div_bt = st.checkbox("📈 近3月YoY乖離度（需要超過1年的股價歷史，明顯拉長抓取時間）", value=False, key="bt_include_div")
+        include_inst_bt = st.checkbox("🏦 三大法人買賣超（近3月）", value=False, key="bt_include_inst")
         backtest_clicked = st.button("🔬 執行歷史回測（過去3個月）", use_container_width=True)
-        if backtest_clicked:
-            if not api_token:
-                st.error("請輸入 FinMind API Token")
-            else:
-                run_historical_backtest(api_token, months_back=3)
-
-        bt_df = load_backtest_df()
-        if bt_df is not None and not bt_df.empty:
-            st.markdown(
-                f"**目前累積 {len(bt_df):,} 筆評估紀錄**"
-                f"（{bt_df['eval_date'].min()} ～ {bt_df['eval_date'].max()}）"
-            )
-
-            st.markdown("##### 📊 評分區間 vs 實際報酬")
-            st.dataframe(analyze_score_buckets(bt_df), hide_index=True, use_container_width=True)
-
-            st.markdown("##### 🚀 「強勢突破盤」標記 vs 實際報酬")
-            st.dataframe(analyze_tag_hitrate(bt_df, "is_breakout", "強勢突破盤"), hide_index=True, use_container_width=True)
-
-            st.markdown("##### 🎯 「跌深反彈盤」標記 vs 實際報酬")
-            st.dataframe(analyze_tag_hitrate(bt_df, "is_pullback_rebound", "跌深反彈盤"), hide_index=True, use_container_width=True)
-
-            st.markdown("##### 🎛️ 參數網格搜尋")
-            st.caption(
-                "⚠️ 這是在已收集的歷史資料上找『表現較好』的參數組合，樣本數有限時容易"
-                "過度適配——建議當作方向參考，人工確認合理後再手動調整正式評分公式，"
-                "不要照單全收直接套用。"
-            )
-            horizon_choice = st.selectbox("優化目標天數", BACKTEST_HORIZONS, index=1, key="grid_horizon")
-            grid_df = grid_search_params(bt_df, target_horizon=horizon_choice)
-            if not grid_df.empty:
-                st.dataframe(grid_df, hide_index=True, use_container_width=True)
-            else:
-                st.caption("資料量還不夠做網格搜尋分析（需要至少20筆訊號才會列入單一組合）。")
-        else:
-            st.caption("尚未執行過歷史回測，點上面的按鈕開始。")
 
     top100_clicked = st.button("🔥 漲幅前100分析", use_container_width=True)
     if top100_clicked:
@@ -2483,6 +2703,75 @@ def run_batch_analysis():
 
 if run_clicked or st.session_state.pop("_run_after_top100", False):
     run_batch_analysis()
+
+
+# ────────────────────────────────────────────────────────────────
+# 歷史回測分析結果（觸發鈕在側邊欄，實際執行跟結果顯示都放在主畫面，
+# 表格才有足夠寬度顯示，不會被側邊欄窄版面切掉欄位）
+# ────────────────────────────────────────────────────────────────
+if backtest_clicked:
+    if not api_token:
+        st.error("請輸入 FinMind API Token")
+    else:
+        run_historical_backtest(api_token, months_back=3,
+                                 include_div=include_div_bt, include_inst=include_inst_bt)
+
+bt_df = load_backtest_df()
+if bt_df is not None and not bt_df.empty:
+    st.divider()
+    st.markdown("## 🔬 歷史回測分析結果")
+    st.markdown(
+        f"**目前累積 {len(bt_df):,} 筆評估紀錄**"
+        f"（{bt_df['eval_date'].min()} ～ {bt_df['eval_date'].max()}）"
+    )
+
+    st.markdown("##### 📊 評分區間 vs 實際報酬")
+    st.dataframe(analyze_score_buckets(bt_df), hide_index=True, use_container_width=True)
+
+    st.markdown("##### 🚀 「強勢突破盤」標記 vs 實際報酬")
+    st.dataframe(analyze_tag_hitrate(bt_df, "is_breakout", "強勢突破盤"), hide_index=True, use_container_width=True)
+
+    st.markdown("##### 🎯 「跌深反彈盤」標記 vs 實際報酬")
+    st.dataframe(analyze_tag_hitrate(bt_df, "is_pullback_rebound", "跌深反彈盤"), hide_index=True, use_container_width=True)
+
+    if "pattern_breakout" in bt_df.columns and bt_df["pattern_breakout"].notna().any():
+        st.markdown("##### 🔍 「型態突破確認」標記 vs 實際報酬")
+        st.dataframe(analyze_tag_hitrate(bt_df, "pattern_breakout", "型態突破確認"), hide_index=True, use_container_width=True)
+
+    if "pb_all_pass" in bt_df.columns and bt_df["pb_all_pass"].notna().any():
+        st.markdown("##### ✅ 「回後買上漲全通過」標記 vs 實際報酬")
+        st.dataframe(analyze_tag_hitrate(bt_df, "pb_all_pass", "回後買上漲全通過"), hide_index=True, use_container_width=True)
+
+    st.markdown("##### 🎛️ 參數網格搜尋（單一評分公式的權重調整）")
+    st.caption(
+        "⚠️ 這是在已收集的歷史資料上找『表現較好』的參數組合，樣本數有限時容易"
+        "過度適配——建議當作方向參考，人工確認合理後再手動調整正式評分公式，"
+        "不要照單全收直接套用。"
+    )
+    horizon_choice = st.selectbox("優化目標天數", BACKTEST_HORIZONS, index=1, key="grid_horizon")
+    grid_df = grid_search_params(bt_df, target_horizon=horizon_choice)
+    if not grid_df.empty:
+        st.dataframe(grid_df, hide_index=True, use_container_width=True)
+    else:
+        st.caption("資料量還不夠做網格搜尋分析（需要至少20筆訊號才會列入單一組合）。")
+
+    st.markdown("##### 🧩 多因子複選搜尋（找出哪幾項欄位組合起來勝率最高）")
+    st.caption(
+        "窮舉1~3個條件旗標（分數門檻、強勢突破盤、跌深反彈盤、布林通道位置、"
+        "型態確認、乖離度、法人買賣超…）的AND組合，看哪個組合的勝率/平均報酬"
+        "最好。⚠️ 測試的組合越多，純粹運氣好而表現突出的組合也會越多（多重"
+        "比較問題），下面會顯示總共測了幾種組合——組合數越多，排在前面的結果"
+        "就越需要保留懷疑，不代表真的有效，建議搭配樣本數一起看，樣本數太小"
+        "（例如剛好卡在門檻附近）的組合更不可信。"
+    )
+    combo_horizon = st.selectbox("優化目標天數", BACKTEST_HORIZONS, index=1, key="combo_horizon")
+    combo_min_samples = st.number_input("最小樣本數門檻", min_value=10, max_value=1000, value=50, step=10, key="combo_min_samples")
+    combo_df, combos_tested = combo_search(bt_df, target_horizon=combo_horizon, min_samples=combo_min_samples)
+    st.caption(f"共測試了 {combos_tested:,} 種條件組合")
+    if not combo_df.empty:
+        st.dataframe(combo_df, hide_index=True, use_container_width=True)
+    else:
+        st.caption("目前沒有任何組合的樣本數達到門檻，試著調低最小樣本數，或先累積更多回測資料。")
 
 
 # ────────────────────────────────────────────────────────────────
