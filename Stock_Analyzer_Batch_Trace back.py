@@ -610,6 +610,31 @@ def calc_kd(data, period=9):
     return {"k": k_arr, "d": d_arr}
 
 
+# ── KDJ(6,3,3)：跟上面的calc_kd（9,3,3，給K線圖用）是兩套獨立參數，不要共用──
+# RSV回看6天（不是9天），K/D平滑因子都是3。J = 3K - 2D。
+def calc_kdj(data, period=6, k_n=3, d_n=3):
+    k_arr, d_arr, j_arr = [], [], []
+    prev_k, prev_d = 50.0, 50.0
+    for i in range(len(data)):
+        if i < period - 1:
+            k_arr.append(None)
+            d_arr.append(None)
+            j_arr.append(None)
+            continue
+        window = data[i - period + 1:i + 1]
+        lowest = min(d["low"] for d in window)
+        highest = max(d["high"] for d in window)
+        rsv = 50 if highest == lowest else (data[i]["close"] - lowest) / (highest - lowest) * 100
+        k = prev_k * (k_n - 1) / k_n + rsv * 1 / k_n
+        d = prev_d * (d_n - 1) / d_n + k * 1 / d_n
+        j = 3 * k - 2 * d
+        k_arr.append(k)
+        d_arr.append(d)
+        j_arr.append(j)
+        prev_k, prev_d = k, d
+    return {"k": k_arr, "d": d_arr, "j": j_arr}
+
+
 def enrich(data):
     closes = [d["close"] for d in data]
     volumes = [d["volume"] for d in data]
@@ -619,6 +644,7 @@ def enrich(data):
     bbs = calc_bb_series(closes)
     vm5, vm20 = calc_volma(volumes, 5), calc_volma(volumes, 20)
     kd = calc_kd(data, 9)
+    kdj = calc_kdj(data, 6, 3, 3)
     out = []
     for i, d in enumerate(data):
         out.append({
@@ -629,6 +655,7 @@ def enrich(data):
             "rsi": rs[i], "bbU": bbs[i]["u"], "bbL": bbs[i]["l"],
             "vm5": vm5[i], "vm20": vm20[i],
             "kdK": kd["k"][i], "kdD": kd["d"][i],
+            "kdjK": kdj["k"][i], "kdjD": kdj["d"][i], "kdjJ": kdj["j"][i],
         })
     return out
 
@@ -952,9 +979,31 @@ def compute_core_signals(data, dm):
 
         is_pullback_rebound = bb_pos is not None and bb_pos <= 20 and divergence_detected and golden_cross_recent
 
+    # ── KDJ(6,3,3) 黃金交叉／死亡交叉：K由下往上穿越D＝黃金交叉（多方），
+    # K由上往下穿越D＝死亡交叉（空方）。跟MACD黃金交叉用同一套「近3天內」判斷法。
+    kdj_state = None
+    kdj_golden_cross_recent = False
+    kdj_death_cross_recent = False
+    if last.get("kdjK") is not None and last.get("kdjD") is not None:
+        kdj_state = "K>D（多方）" if last["kdjK"] > last["kdjD"] else ("K<D（空方）" if last["kdjK"] < last["kdjD"] else "K=D")
+        for kci in range(max(1, len(data) - 3), len(data)):
+            kc_cur, kc_prev = data[kci], data[kci - 1]
+            if (kc_cur.get("kdjK") is not None and kc_cur.get("kdjD") is not None
+                    and kc_prev.get("kdjK") is not None and kc_prev.get("kdjD") is not None):
+                if kc_prev["kdjK"] <= kc_prev["kdjD"] and kc_cur["kdjK"] > kc_cur["kdjD"]:
+                    kdj_golden_cross_recent = True
+                if kc_prev["kdjK"] >= kc_prev["kdjD"] and kc_cur["kdjK"] < kc_cur["kdjD"]:
+                    kdj_death_cross_recent = True
+        if kdj_golden_cross_recent:
+            kdj_state += "　⚡近3日黃金交叉"
+        if kdj_death_cross_recent:
+            kdj_state += "　💀近3日死亡交叉"
+
     return {"bb_pos": bb_pos, "macd_state": macd_state,
             "is_breakout": is_breakout, "is_pullback_rebound": is_pullback_rebound,
-            "golden_cross_recent": golden_cross_recent}
+            "golden_cross_recent": golden_cross_recent,
+            "kdj_state": kdj_state, "kdj_golden_cross_recent": kdj_golden_cross_recent,
+            "kdj_death_cross_recent": kdj_death_cross_recent}
 
 
 # ────────────────────────────────────────────────────────────────
@@ -1080,6 +1129,16 @@ def run_full_market_snapshot(token: str):
 # 用同一個資料庫檔案（SNAPSHOT_DB_PATH），存到另一張表 backtest_evals。
 # ────────────────────────────────────────────────────────────────
 BACKTEST_HORIZONS = [5, 10, 20]  # 事後驗證用的天數（皆為交易日）
+# detect_patterns()裡14種型態的id/name對照（回後買上漲是獨立算的pb_all_pass，
+# 不在這14種裡——外面常講的「15種進場型態」是這14種圖形型態+回後買上漲）。
+PATTERN_DEFS = [
+    {"id": "hs", "name": "頭肩底"}, {"id": "chs", "name": "複式頭肩底"}, {"id": "nb", "name": "N字底"},
+    {"id": "tb", "name": "三重底"}, {"id": "rb", "name": "圓弧底"}, {"id": "fb", "name": "一字底(均線糾結)"},
+    {"id": "abc", "name": "突破ABC修正下降切線"}, {"id": "channel", "name": "突破上升軌道線"},
+    {"id": "blackk", "name": "突破飆股大量黑K最高點"}, {"id": "kbp", "name": "K線橫盤的突破"},
+    {"id": "harami_bear", "name": "母子懷抱(高檔)"}, {"id": "harami_bull", "name": "母子懷抱(低檔)"},
+    {"id": "morning_star", "name": "晨星"}, {"id": "evening_star", "name": "夜星"},
+]
 
 
 def init_backtest_table():
@@ -1116,6 +1175,9 @@ def init_backtest_table():
         "price_yoy_3m REAL",
         "inst_3m REAL",
         "golden_cross_recent INTEGER",
+        "kdj_golden_cross_recent INTEGER",
+        "kdj_death_cross_recent INTEGER",
+        "pattern_hits_json TEXT",
     ]:
         try:
             conn.execute(f"ALTER TABLE backtest_evals ADD COLUMN {col_def}")
@@ -1126,7 +1188,8 @@ def init_backtest_table():
 
 
 def run_historical_backtest(token: str, months_back: int = 3, include_pattern: bool = True,
-                             include_div: bool = False, include_inst: bool = False):
+                             include_div: bool = False, include_inst: bool = False,
+                             min_liquidity: float = 0):
     """回溯過去 months_back 個月，對每個交易日重新計算「當時」的DMI/評分/訊號
     （只用當天以前的資料切片再丟進既有的 calc_dmi／score_dmi／compute_core_signals／
     check_pullback_buy／detect_patterns，保證沒有偷看未來——這幾個函式本來就是
@@ -1205,12 +1268,19 @@ def run_historical_backtest(token: str, months_back: int = 3, include_pattern: b
                 eval_date = data[idx]["date"]
                 if eval_date < eval_window_start_date:
                     continue
+                if min_liquidity > 0:
+                    liq_start = max(0, idx - 19)
+                    liq_bars = data[liq_start:idx + 1]
+                    avg_liquidity = sum(b["close"] * b["volume"] for b in liq_bars) / len(liq_bars)
+                    if avg_liquidity < min_liquidity:
+                        continue  # 當時的流動性不夠，跳過這個評估點
                 data_slice = data[:idx + 1]  # 只給「當時」以前的資料，不含未來
                 dmi = calc_dmi(data_slice, 14)
                 dm = score_dmi(dmi)
                 sig = compute_core_signals(data_slice, dm)
 
                 pattern_formed, pattern_breakout, pattern_just_broke, pb_all_pass = None, None, None, None
+                pattern_hits_json = None
                 if include_pattern:
                     pb = check_pullback_buy(data_slice)
                     pt = detect_patterns(data_slice, pb)
@@ -1218,6 +1288,11 @@ def run_historical_backtest(token: str, months_back: int = 3, include_pattern: b
                     pattern_breakout = int(pt["anyBreakout"])
                     pattern_just_broke = int(pt["anyJustBroke"])
                     pb_all_pass = int(pb["allPass"])
+                    # 15種型態各自的「剛形成」（justBroke）：跟aggregate的anyJustBroke
+                    # 同一套判斷邏輯，只是拆成每個型態各自記錄。存成JSON字串（SQLite
+                    # 沒有原生的dict欄位），要用時再解回來。
+                    pattern_hits = {pr["id"]: (1 if pr["justBroke"] else 0) for pr in pt["results"]}
+                    pattern_hits_json = json.dumps(pattern_hits)
 
                 div_total, price_yoy_3m = compute_divergence_asof(rev_map, price_month_avg_map, eval_date) if include_div else (None, None)
                 inst_3m = compute_inst_3m_asof(inst_daily_map, eval_date) if include_inst else None
@@ -1234,14 +1309,16 @@ def run_historical_backtest(token: str, months_back: int = 3, include_pattern: b
                     (eval_date, stock_id, name, score, plus_di, minus_di, adx, adxr, bb_pos,
                      is_breakout, is_pullback_rebound, entry_close, ret_5d, ret_10d, ret_20d,
                      pattern_formed, pattern_breakout, pattern_just_broke, pb_all_pass,
-                     div_total, price_yoy_3m, inst_3m, golden_cross_recent, created_at)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                     div_total, price_yoy_3m, inst_3m, golden_cross_recent,
+                     kdj_golden_cross_recent, kdj_death_cross_recent, pattern_hits_json, created_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """, (
                     eval_date, sid, name, dm["score"], dm["plusDI"], dm["minusDI"], dm["adx"], dm["adxr"],
                     sig["bb_pos"], int(sig["is_breakout"]), int(sig["is_pullback_rebound"]), entry_close,
                     rets[5], rets[10], rets[20],
                     pattern_formed, pattern_breakout, pattern_just_broke, pb_all_pass,
                     div_total, price_yoy_3m, inst_3m, int(sig["golden_cross_recent"]),
+                    int(sig["kdj_golden_cross_recent"]), int(sig["kdj_death_cross_recent"]), pattern_hits_json,
                     datetime.now().isoformat(timespec="seconds"),
                 ))
                 saved_rows += 1
@@ -1273,6 +1350,10 @@ def load_backtest_df():
     conn.close()
     if df is None or df.empty:
         return None
+    if "pattern_hits_json" in df.columns:
+        df["pattern_hits"] = df["pattern_hits_json"].apply(
+            lambda s: json.loads(s) if isinstance(s, str) else None
+        )
     return df
 
 
@@ -1313,6 +1394,31 @@ def analyze_tag_hitrate(df: pd.DataFrame, tag_col: str, tag_label: str) -> pd.Da
             row[f"{h}日勝率%"] = round((valid > 0).mean() * 100, 1) if len(valid) else None
         rows.append(row)
     return pd.DataFrame(rows)
+
+
+def analyze_pattern_hits(df: pd.DataFrame) -> pd.DataFrame:
+    """15種型態各自「剛形成」單獨列一列（只看「是」的情況，橫向比較15種型態彼此
+    的表現，不是看單一型態內部有沒有效）。依樣本數由多到少排序，樣本數<10筆的
+    型態不列出，避免單一兩筆資料的100%勝率造成誤導。"""
+    if "pattern_hits" not in df.columns:
+        return pd.DataFrame()
+    rows = []
+    for pdef in PATTERN_DEFS:
+        pid = pdef["id"]
+        mask = df["pattern_hits"].apply(lambda h: bool(h) and h.get(pid) == 1)
+        g = df[mask]
+        if len(g) < 10:
+            continue
+        row = {"型態": pdef["name"] + "剛形成", "樣本數": len(g)}
+        for h in BACKTEST_HORIZONS:
+            valid = g[f"ret_{h}d"].dropna()
+            row[f"{h}日平均報酬%"] = round(valid.mean(), 2) if len(valid) else None
+            row[f"{h}日勝率%"] = round((valid > 0).mean() * 100, 1) if len(valid) else None
+        rows.append(row)
+    result = pd.DataFrame(rows)
+    if not result.empty:
+        result = result.sort_values("樣本數", ascending=False).reset_index(drop=True)
+    return result
 
 
 def grid_search_params(df: pd.DataFrame, target_horizon: int = 10):
@@ -1377,6 +1483,10 @@ def build_condition_flags(df: pd.DataFrame) -> pd.DataFrame:
     flags["布林通道高檔(≥80%)"] = d["bb_pos"] >= 80
     if "golden_cross_recent" in d.columns and d["golden_cross_recent"].notna().any():
         flags["MACD近3日內黃金交叉"] = d["golden_cross_recent"] == 1
+    if "kdj_golden_cross_recent" in d.columns and d["kdj_golden_cross_recent"].notna().any():
+        flags["KDJ近3日內黃金交叉"] = d["kdj_golden_cross_recent"] == 1
+    if "kdj_death_cross_recent" in d.columns and d["kdj_death_cross_recent"].notna().any():
+        flags["KDJ近3日內死亡交叉"] = d["kdj_death_cross_recent"] == 1
 
     if "pattern_formed" in d.columns and d["pattern_formed"].notna().any():
         flags["型態成形中"] = d["pattern_formed"] == 1
@@ -1395,6 +1505,15 @@ def build_condition_flags(df: pd.DataFrame) -> pd.DataFrame:
     if "inst_3m" in d.columns and d["inst_3m"].notna().any():
         flags["三大法人近3月買超"] = d["inst_3m"] > 0
         flags["三大法人近3月賣超"] = d["inst_3m"] < 0
+
+    # 15種進場型態裡的14種圖形型態，各自的「剛形成」單獨當一個條件旗標
+    # （回後買上漲已經是獨立的「回後買上漲全通過」旗標，這裡不重複）。
+    if "pattern_hits" in d.columns and d["pattern_hits"].notna().any():
+        for pdef in PATTERN_DEFS:
+            pid = pdef["id"]
+            flags[pdef["name"] + "剛形成"] = d["pattern_hits"].apply(
+                lambda h: bool(h) and h.get(pid) == 1
+            )
 
     flag_df = pd.DataFrame(flags, index=d.index)
     return pd.concat([d, flag_df], axis=1), list(flags.keys())
@@ -1433,8 +1552,106 @@ def combo_search(df: pd.DataFrame, target_horizon: int = 10, max_combo_size: int
     result_df = pd.DataFrame(results)
     if result_df.empty:
         return result_df, combos_tested
-    result_df = result_df.sort_values(f"{target_horizon}日平均報酬%", ascending=False).head(top_n).reset_index(drop=True)
+    result_df = result_df.sort_values(f"{target_horizon}日勝率%", ascending=False).head(top_n).reset_index(drop=True)
     return result_df, combos_tested
+
+
+def find_moonshot_combos(df: pd.DataFrame, target_horizon: int = 10, threshold: float = 30,
+                          max_combo_size: int = 3, min_samples: int = 20, top_n: int = 20):
+    """飆股搜尋：找哪些條件組合最容易在N天內出現「漲幅超過threshold%」的大行情，
+    跟combo_search看的東西不一樣——那邊看的是『平均表現/整體勝率』，這裡只看
+    『命中大行情的比例』，一個組合平均報酬普通、但只要常常出現飆股也會被排到
+    前面。從沒出現過飆股的組合直接不列出來（沒意義）。飆股本來就是稀有事件，
+    樣本數門檻預設調低到20，但仍要搭配『飆股次數』一起看，次數只有個位數的
+    不建議當真——比例再高，靠幾次極端值撐出來的數字沒有統計意義。"""
+    d, flag_names = build_condition_flags(df)
+    ret_col = f"ret_{target_horizon}d"
+    valid = d.dropna(subset=[ret_col])
+    if valid.empty or not flag_names:
+        return pd.DataFrame(), 0
+
+    results = []
+    combos_tested = 0
+    for size in range(1, max_combo_size + 1):
+        for combo in itertools.combinations(flag_names, size):
+            mask = valid[list(combo)].all(axis=1)
+            combos_tested += 1
+            n_match = int(mask.sum())
+            if n_match < min_samples:
+                continue
+            rets = valid.loc[mask, ret_col]
+            moonshots = rets[rets > threshold]
+            if moonshots.empty:
+                continue
+            results.append({
+                "條件組合": " ＋ ".join(combo),
+                "條件數": size,
+                "樣本數": n_match,
+                "飆股次數": len(moonshots),
+                "飆股比例%": round(len(moonshots) / n_match * 100, 1),
+                "飆股平均漲幅%": round(moonshots.mean(), 1),
+            })
+    result_df = pd.DataFrame(results)
+    if result_df.empty:
+        return result_df, combos_tested
+    result_df = result_df.sort_values("飆股比例%", ascending=False).head(top_n).reset_index(drop=True)
+    return result_df, combos_tested
+
+
+# 使用者指定要追蹤的特定條件組合——跟上面窮舉搜尋不一樣的地方是：這些組合不管
+# 樣本數多少、排名有沒有進前幾名，都一定會顯示出來，方便針對特定假設做比較
+# （例如「型態突破確認+均價YoY轉正」這種有明確邏輯的假設，即使沒有進入排行榜，
+# 使用者可能還是想知道它實際表現如何）。
+PINNED_COMBOS = [
+    ["型態突破確認", "近3月均價YoY為正"],
+    ["型態突破確認", "近3月均價YoY為正", "三大法人近3月買超"],
+    ["多方力道≥65", "布林通道低檔(≤20%)"],
+    # 以下6組是從實際跑過的多因子複選搜尋結果裡挑出來的（勝率前3＋平均報酬前3），
+    # 2026-09-17那次跑的結果，數字會隨每次回測資料不同而變，這裡只是把「當時
+    # 表現最好的組合」記錄下來持續追蹤，不代表未來也會一樣好。
+    # -- 勝率前3 --
+    ["型態突破確認", "近3月乖離度為負(股價超前營收)", "近3月均價YoY為正"],
+    ["布林通道低檔(≤20%)", "近3月均價YoY為正", "三大法人近3月買超"],
+    ["型態成形中", "近3月乖離度為負(股價超前營收)", "近3月均價YoY為正"],
+    # -- 平均報酬前3 --
+    ["型態突破確認", "近3月乖離度為負(股價超前營收)", "三大法人近3月賣超"],
+    ["型態突破確認", "近3月均價YoY為正", "三大法人近3月賣超"],
+    ["布林通道高檔(≥80%)", "近3月乖離度為負(股價超前營收)", "三大法人近3月賣超"],
+]
+
+
+def pinned_combo_stats(df: pd.DataFrame, combos, target_horizon: int = 10) -> pd.DataFrame:
+    """算指定條件組合的表現，不受樣本數門檻或排名影響，全部顯示。缺欄位（例如
+    沒勾選對應的可選資料）或沒有符合樣本的組合，也會列出來並註明原因，而不是
+    悄悄跳過讓使用者以為系統忘了測。"""
+    d, flag_names = build_condition_flags(df)
+    ret_col = f"ret_{target_horizon}d"
+    valid = d.dropna(subset=[ret_col]) if ret_col in d.columns else d.iloc[0:0]
+
+    rows = []
+    for combo in combos:
+        label = " ＋ ".join(combo)
+        missing = [c for c in combo if c not in flag_names]
+        if missing:
+            rows.append({"條件組合": label, "樣本數": 0,
+                         f"{target_horizon}日平均報酬%": None, f"{target_horizon}日勝率%": None,
+                         "備註": f"缺少欄位（可能沒勾選對應的可選資料）：{'、'.join(missing)}"})
+            continue
+        mask = valid[combo].all(axis=1)
+        n_match = int(mask.sum())
+        if n_match == 0:
+            rows.append({"條件組合": label, "樣本數": 0,
+                         f"{target_horizon}日平均報酬%": None, f"{target_horizon}日勝率%": None,
+                         "備註": "目前回測資料裡沒有符合這個組合的樣本"})
+            continue
+        rets = valid.loc[mask, ret_col]
+        rows.append({
+            "條件組合": label, "樣本數": n_match,
+            f"{target_horizon}日平均報酬%": round(rets.mean(), 2),
+            f"{target_horizon}日勝率%": round((rets > 0).mean() * 100, 1),
+            "備註": "" if n_match >= 50 else "⚠️樣本數偏少，僅供參考",
+        })
+    return pd.DataFrame(rows)
 
 
 # ────────────────────────────────────────────────────────────────
@@ -2566,17 +2783,27 @@ with st.sidebar:
                 run_full_market_snapshot(api_token)
 
     with st.expander("🔬 歷史回測分析（事後驗證＋參數優化）"):
-        months_back_bt = st.number_input("回測天數（月）", min_value=1, max_value=12, value=3, step=1, key="bt_months_back")
+        months_back_bt = st.number_input("回測天數（月）", min_value=1, max_value=36, value=3, step=1, key="bt_months_back")
         st.caption(
             "回溯過去N個月，用「上市清單」重新計算每個交易日『當時』的DMI/多方力道評分"
             "（只用當天以前的資料，沒有偷看未來），對照5/10/20個交易日後的實際報酬，"
             "驗證現有評分公式準不準，並試算不同參數組合的效果。月數愈大，全市場規模跑"
-            "的時間愈長（3個月約15-25分鐘，等比例往上抓），過程中請勿切換分頁或關閉視窗。"
-            "分析結果會顯示在右側主畫面。"
+            "的時間愈長，且不是單純等比例——評估天數增加，每檔股票要重算的次數也跟著"
+            "變多（型態辨識、回後買上漲每個評估點都要重跑一次），拉到36個月時，光是"
+            "評估紀錄就可能超過70-80萬筆，跑完可能要1小時以上，建議先從6-12個月試跑，"
+            "確認可行再拉長。過程中請勿切換分頁或關閉視窗。分析結果會顯示在右側主畫面。"
         )
         st.caption("型態確認、回後買上漲不需要額外API，一律會記錄。以下兩項各自要多抓一組資料，會拉長時間：")
         include_div_bt = st.checkbox("📈 近3月YoY乖離度（需要超過1年的股價歷史，明顯拉長抓取時間）", value=False, key="bt_include_div")
         include_inst_bt = st.checkbox("🏦 三大法人買賣超（近3月）", value=False, key="bt_include_inst")
+        min_liquidity_wan_bt = st.number_input(
+            "最低近20日均成交金額（萬元，0＝不篩選）", min_value=0, value=0, step=100, key="bt_min_liquidity"
+        )
+        st.caption(
+            "排除成交量太小的殭屍股：每個評估點各自檢查『當時』往前20天的平均成交金額"
+            "（收盤價×成交量），低於門檻就跳過那個評估點——不是只看現在，避免用現在的"
+            "流動性去篩過去的資料。"
+        )
         backtest_clicked = st.button("🔬 執行歷史回測", use_container_width=True)
 
     top100_clicked = st.button("🔥 漲幅前100分析", use_container_width=True)
@@ -2738,7 +2965,8 @@ if backtest_clicked:
         st.error("請輸入 FinMind API Token")
     else:
         run_historical_backtest(api_token, months_back=int(months_back_bt),
-                                 include_div=include_div_bt, include_inst=include_inst_bt)
+                                 include_div=include_div_bt, include_inst=include_inst_bt,
+                                 min_liquidity=float(min_liquidity_wan_bt) * 10000)
 
 bt_df = load_backtest_df()
 if bt_df is not None and not bt_df.empty:
@@ -2762,6 +2990,14 @@ if bt_df is not None and not bt_df.empty:
         st.markdown("##### ⚡ 「MACD近3日內黃金交叉」標記 vs 實際報酬")
         st.dataframe(analyze_tag_hitrate(bt_df, "golden_cross_recent", "MACD黃金交叉"), hide_index=True, use_container_width=True)
 
+    if "kdj_golden_cross_recent" in bt_df.columns and bt_df["kdj_golden_cross_recent"].notna().any():
+        st.markdown("##### 🟢 「KDJ近3日內黃金交叉」標記 vs 實際報酬")
+        st.dataframe(analyze_tag_hitrate(bt_df, "kdj_golden_cross_recent", "KDJ黃金交叉"), hide_index=True, use_container_width=True)
+
+    if "kdj_death_cross_recent" in bt_df.columns and bt_df["kdj_death_cross_recent"].notna().any():
+        st.markdown("##### 🔴 「KDJ近3日內死亡交叉」標記 vs 實際報酬")
+        st.dataframe(analyze_tag_hitrate(bt_df, "kdj_death_cross_recent", "KDJ死亡交叉"), hide_index=True, use_container_width=True)
+
     if "pattern_breakout" in bt_df.columns and bt_df["pattern_breakout"].notna().any():
         st.markdown("##### 🔍 「型態突破確認」標記 vs 實際報酬")
         st.dataframe(analyze_tag_hitrate(bt_df, "pattern_breakout", "型態突破確認"), hide_index=True, use_container_width=True)
@@ -2773,6 +3009,12 @@ if bt_df is not None and not bt_df.empty:
     if "pb_all_pass" in bt_df.columns and bt_df["pb_all_pass"].notna().any():
         st.markdown("##### ✅ 「回後買上漲全通過」標記 vs 實際報酬")
         st.dataframe(analyze_tag_hitrate(bt_df, "pb_all_pass", "回後買上漲全通過"), hide_index=True, use_container_width=True)
+
+    pattern_hits_df = analyze_pattern_hits(bt_df)
+    if not pattern_hits_df.empty:
+        st.markdown("##### 📐 15種型態各自「剛形成」vs 實際報酬")
+        st.caption("依樣本數由多到少排序，樣本數<10筆的型態不列出（資料太少沒有參考意義）。這是每種型態單獨、不跟其他條件混在一起的乾淨表現。")
+        st.dataframe(pattern_hits_df, hide_index=True, use_container_width=True)
 
     st.markdown("##### 🎛️ 參數網格搜尋（單一評分公式的權重調整）")
     st.caption(
@@ -2804,6 +3046,34 @@ if bt_df is not None and not bt_df.empty:
         st.dataframe(combo_df, hide_index=True, use_container_width=True)
     else:
         st.caption("目前沒有任何組合的樣本數達到門檻，試著調低最小樣本數，或先累積更多回測資料。")
+
+    st.markdown("##### 🎯 指定組合追蹤")
+    st.caption(
+        "手動指定要追蹤的組合，不受上面的樣本數門檻或排名影響，一律顯示（含備註說明"
+        "為什麼樣本數是0，例如沒勾選對應的可選資料、或回測資料裡沒有符合的樣本）。"
+    )
+    pinned_df = pinned_combo_stats(bt_df, PINNED_COMBOS, target_horizon=combo_horizon)
+    st.dataframe(pinned_df, hide_index=True, use_container_width=True)
+
+    st.markdown("##### 🚀 飆股搜尋（找出最容易出現大行情的組合）")
+    st.caption(
+        "這裡看的不是『平均勝率』，是『這個組合出現後，有多高比例會在N天內飆漲"
+        "超過門檻%』——一個組合平均報酬普通，只要常常噴出大行情，一樣會排在前面。"
+        "⚠️ 飆股本來就是稀有事件，樣本數少時『飆股比例』很容易被少數幾次極端行情"
+        "撐出虛高的數字，務必搭配『飆股次數』一起看，次數只有個位數的不建議當真。"
+        "從沒出現過飆股的組合不會列出來。"
+    )
+    ms_col1, ms_col2 = st.columns(2)
+    moonshot_horizon = ms_col1.selectbox("天數", BACKTEST_HORIZONS, index=1, key="moonshot_horizon")
+    moonshot_threshold = ms_col2.number_input("漲幅門檻(%)", min_value=5, max_value=200, value=30, step=5, key="moonshot_threshold")
+    moonshot_df, moonshot_combos_tested = find_moonshot_combos(
+        bt_df, target_horizon=moonshot_horizon, threshold=moonshot_threshold
+    )
+    st.caption(f"共測試了 {moonshot_combos_tested:,} 種條件組合，其中有飆股紀錄的列在下面：")
+    if not moonshot_df.empty:
+        st.dataframe(moonshot_df, hide_index=True, use_container_width=True)
+    else:
+        st.caption("目前沒有任何組合出現過符合門檻的飆股，可以試著調低漲幅門檻，或先累積更多回測資料。")
 
 
 # ────────────────────────────────────────────────────────────────
@@ -2976,6 +3246,26 @@ else:
             elif is_pullback_rebound:
                 combo_tag = "　🎯 跌深反彈盤"
 
+        # KDJ(6,3,3) 黃金交叉／死亡交叉狀態
+        kdj_state_txt = "無資料"
+        if last.get("kdjK") is not None and last.get("kdjD") is not None:
+            kdj_bullish = last["kdjK"] > last["kdjD"]
+            kdj_state_txt = "K>D（多方）" if kdj_bullish else "K<D（空方）"
+            kdj_gold, kdj_dead = False, False
+            kdj_data = r["data"]
+            for kdi in range(max(1, len(kdj_data) - 3), len(kdj_data)):
+                kd_cur, kd_prev = kdj_data[kdi], kdj_data[kdi - 1]
+                if (kd_cur.get("kdjK") is not None and kd_cur.get("kdjD") is not None
+                        and kd_prev.get("kdjK") is not None and kd_prev.get("kdjD") is not None):
+                    if kd_prev["kdjK"] <= kd_prev["kdjD"] and kd_cur["kdjK"] > kd_cur["kdjD"]:
+                        kdj_gold = True
+                    if kd_prev["kdjK"] >= kd_prev["kdjD"] and kd_cur["kdjK"] < kd_cur["kdjD"]:
+                        kdj_dead = True
+            if kdj_gold:
+                kdj_state_txt += "　⚡近3日黃金交叉"
+            if kdj_dead:
+                kdj_state_txt += "　💀近3日死亡交叉"
+
         row = {
             "_idx": i, "股票": f"{r['stockId']} {r['name']}" + (" 🔴即時" if r.get("realtime") else ""), "多方力道": r["total"], "評等": score_lbl,
             "+DI": round(dm["plusDI"], 1) if dm["plusDI"] is not None else None,
@@ -2984,6 +3274,7 @@ else:
             "ADXR": round(dm["adxr"], 1) if dm["adxr"] is not None else None,
             "布林通道位置": bb_pos_txt,
             "MACD狀態": macd_state_txt + combo_tag,
+            "KDJ狀態": kdj_state_txt,
             "漲跌%": round(chgp, 2), "收盤": round(last["close"], 1),
         }
         if show_pe:
