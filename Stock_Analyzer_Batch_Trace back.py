@@ -3398,6 +3398,24 @@ else:
 
     st.markdown("### 📋 批次分析摘要")
 
+    with st.expander(f"📖「指定組合命中」編號對照 — 高勝率 {len(PINNED_COMBOS)}組／高標股 {len(MOONSHOT_COMBOS)}組（點開查看完整條件）"):
+        st.markdown("**⬥ 高勝率（#編號）**")
+        if PINNED_COMBOS:
+            for idx, combo in enumerate(PINNED_COMBOS):
+                key = " ＋ ".join(combo)
+                wr_txt = format_winrates(PINNED_COMBO_WINRATES.get(key))
+                st.markdown(f"`#{idx+1}` {key}" + (f"　（歷史勝率：{wr_txt}）" if wr_txt else ""))
+        else:
+            st.caption("目前清單是空的。")
+        st.markdown("**⬥ 高標股（M編號，容易命中大行情，不代表整體勝率高）**")
+        if MOONSHOT_COMBOS:
+            for idx, combo in enumerate(MOONSHOT_COMBOS):
+                key = " ＋ ".join(combo)
+                stats_txt = format_moonshot_stats(MOONSHOT_COMBO_STATS.get(key))
+                st.markdown(f"`M{idx+1}` {key}" + (f"　（{stats_txt}）" if stats_txt else ""))
+        else:
+            st.caption("目前清單是空的。")
+
     fcol1, fcol2, fcol3, fcol4 = st.columns([1, 1, 1, 1.4])
     with fcol1:
         pb_filter = st.selectbox("進場條件", ["全部", "✅ 符合進場", "❌ 不符合"], key="pb_filter")
@@ -3697,6 +3715,27 @@ else:
         vr = (last["volume"] / last["vm20"]) if last["vm20"] else 1
         m3.metric("量比 vs MA20", f"{vr:.2f}x", "放量" if vr > 1.2 else ("縮量" if vr < 0.8 else "正常"))
         m4.metric("資料日期", last["date"])
+
+        try:
+            pinned_idx = matched_pinned_combos(r)
+        except Exception:
+            pinned_idx = []
+        try:
+            moonshot_idx = matched_moonshot_combos(r)
+        except Exception:
+            moonshot_idx = []
+        if pinned_idx or moonshot_idx:
+            st.markdown("##### 🎯 指定組合命中細節")
+            for idx in pinned_idx:
+                combo = PINNED_COMBOS[idx]
+                key = " ＋ ".join(combo)
+                wr_txt = format_winrates(PINNED_COMBO_WINRATES.get(key))
+                st.success(f"**#{idx+1}** {key}" + (f"　（歷史勝率：{wr_txt}）" if wr_txt else ""))
+            for idx in moonshot_idx:
+                combo = MOONSHOT_COMBOS[idx]
+                key = " ＋ ".join(combo)
+                stats_txt = format_moonshot_stats(MOONSHOT_COMBO_STATS.get(key))
+                st.warning(f"**M{idx+1}** {key}" + (f"　（{stats_txt}）" if stats_txt else ""))
 
         st.divider()
         st.markdown("### 📊 多方力道評分")
