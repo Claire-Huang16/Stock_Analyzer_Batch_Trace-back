@@ -30,6 +30,7 @@
 #      python stock_analyzer_poc.py daily --list top100 --token 你的FinMindToken
 # ════════════════════════════════════════════════════════════════════
 import math
+import re
 import json
 import time
 import io
@@ -2105,19 +2106,153 @@ def summary_frame(results, extras_flags, K, live=None):
         rec['_pbPass'] = pb['allPass']
         rec['_pt'] = 'justbreak' if pt['anyJustBroke'] else ('breakout' if pt['anyBreakout'] else ('forming' if pt['anyFormed'] else 'none'))
         recs.append(rec)
-    return pd.DataFrame(recs)
+    df = pd.DataFrame(recs)
+    if not len(df):
+        return df
+    # 欄位順序：股票、名稱之後依序放 股價、漲跌幅%、選股型命中、指定組合命中、型態確認；不顯示 評等、命中數
+    df = df.rename(columns={'收盤': '股價'}).drop(columns=['評等', '命中數'], errors='ignore')
+    front = ['股票', '名稱', '股價', '漲跌幅%', '選股型命中', '指定組合命中', '型態確認']
+    return df[[c for c in front if c in df.columns] + [c for c in df.columns if c not in front]]
+
+
+def _xl_col(i):
+    """0 → A, 25 → Z, 26 → AA"""
+    s = ''
+    i += 1
+    while i:
+        i, r = divmod(i - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+
+def _auto_widths(df):
+    out = []
+    for c in df.columns:
+        vals = [str(c)] + [str(v) for v in df[c].tolist()[:2000]]
+        out.append(min(max(max(len(x) for x in vals) + 2, 8), 40))
+    return out
+
+
+def _xlsx_builtin(sheets, widths=None, wrap=False):
+    """沒有 openpyxl／xlsxwriter 時的備援：用標準函式庫 zipfile 直接產生 .xlsx（Excel 可正常開啟）"""
+    import zipfile
+    from xml.sax.saxutils import escape
+
+    sa = ' s="1"' if wrap else ''
+
+    def cell(ref, v):
+        if v is None or (isinstance(v, float) and (math.isnan(v) or math.isinf(v))):
+            return ''
+        if isinstance(v, (bool, np.bool_)):
+            return f'<c r="{ref}" t="b"><v>{int(v)}</v></c>'
+        if isinstance(v, (int, float, np.integer, np.floating)):
+            return f'<c r="{ref}"{sa}><v>{v}</v></c>'
+        txt = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', escape(str(v)))
+        return f'<c r="{ref}" t="inlineStr"{sa}><is><t xml:space="preserve">{txt}</t></is></c>'
+
+    bio = io.BytesIO()
+    with zipfile.ZipFile(bio, 'w', zipfile.ZIP_DEFLATED) as z:
+        names = [str(n)[:31] for n, _ in sheets]
+        z.writestr('[Content_Types].xml',
+                   '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                   '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+                   '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+                   '<Default Extension="xml" ContentType="application/xml"/>'
+                   '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+                   '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>'
+                   + ''.join(f'<Override PartName="/xl/worksheets/sheet{i + 1}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+                             for i in range(len(sheets))) + '</Types>')
+        z.writestr('_rels/.rels',
+                   '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                   '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                   '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>'
+                   '</Relationships>')
+        z.writestr('xl/workbook.xml',
+                   '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                   '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+                   'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>'
+                   + ''.join(f'<sheet name="{escape(n)}" sheetId="{i + 1}" r:id="rId{i + 1}"/>' for i, n in enumerate(names))
+                   + '</sheets></workbook>')
+        z.writestr('xl/_rels/workbook.xml.rels',
+                   '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                   '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                   + ''.join(f'<Relationship Id="rId{i + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet{i + 1}.xml"/>'
+                             for i in range(len(sheets)))
+                   + f'<Relationship Id="rId{len(sheets) + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>'
+                   '</Relationships>')
+        z.writestr('xl/styles.xml',
+                   '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                   '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+                   '<fonts count="1"><font><sz val="11"/><name val="Calibri"/></font></fonts>'
+                   '<fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill></fills>'
+                   '<borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>'
+                   '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
+                   '<cellXfs count="2"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>'
+                   '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0" applyAlignment="1"><alignment wrapText="1" vertical="top"/></xf></cellXfs>'
+                   '</styleSheet>')
+        for si, (_, df) in enumerate(sheets):
+            ws = widths if widths else _auto_widths(df)
+            cols = ''.join(f'<col min="{i + 1}" max="{i + 1}" width="{w}" customWidth="1"/>' for i, w in enumerate(ws))
+            rows = ['<row r="1">' + ''.join(cell(f'{_xl_col(j)}1', str(c)) for j, c in enumerate(df.columns)) + '</row>']
+            for ri, rec in enumerate(df.itertuples(index=False), start=2):
+                rows.append(f'<row r="{ri}">' + ''.join(cell(f'{_xl_col(j)}{ri}', v) for j, v in enumerate(rec)) + '</row>')
+            z.writestr(f'xl/worksheets/sheet{si + 1}.xml',
+                       '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                       '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+                       + (f'<cols>{cols}</cols>' if cols else '') + '<sheetData>' + ''.join(rows) + '</sheetData></worksheet>')
+    return bio.getvalue()
+
+
+def sheets_to_xlsx(sheets, widths=None, wrap=False):
+    """[(工作表名, DataFrame), ...] → .xlsx bytes。
+    依序嘗試 openpyxl → xlsxwriter → 內建備援（標準函式庫），任何環境都不會因為少裝套件而整頁當掉。
+    widths：各欄寬（None＝依內容自動）；wrap：內容自動換行、靠上對齊。"""
+    bad = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f]')   # Excel 不接受的控制字元
+
+    def clean(d):
+        d = d if isinstance(d, pd.DataFrame) else pd.DataFrame(d)
+        d = d.copy()
+        for c in d.columns:
+            if d[c].dtype == object:
+                d[c] = d[c].map(lambda v: bad.sub('', v) if isinstance(v, str) else v)
+        return d
+    sheets = [(str(n)[:31], clean(d)) for n, d in sheets]
+    for engine in ('openpyxl', 'xlsxwriter'):
+        try:
+            __import__(engine)
+        except ImportError:
+            continue
+        try:
+            return _xlsx_with_engine(sheets, engine, widths, wrap)
+        except Exception:  # noqa  這個引擎失敗就換下一個，最後用內建備援
+            continue
+    return _xlsx_builtin(sheets, widths, wrap)
+
+
+def _xlsx_with_engine(sheets, engine, widths, wrap):
+    bio = io.BytesIO()
+    with pd.ExcelWriter(bio, engine=engine) as w:
+        for name, df in sheets:
+            df.to_excel(w, index=False, sheet_name=name)
+            ws_ = widths if widths else _auto_widths(df)
+            sh = w.sheets[name]
+            if engine == 'openpyxl':
+                from openpyxl.styles import Alignment
+                for i, wd in enumerate(ws_):
+                    sh.column_dimensions[_xl_col(i)].width = wd
+                if wrap:
+                    for row in sh.iter_rows(min_row=2):
+                        for c in row:
+                            c.alignment = Alignment(wrap_text=True, vertical='top')
+            else:
+                fmt = w.book.add_format({'text_wrap': True, 'valign': 'top'}) if wrap else None
+                for i, wd in enumerate(ws_):
+                    sh.set_column(i, i, wd, fmt)
+    return bio.getvalue()
 
 
 def df_to_excel_bytes(df, sheet):
-    bio = io.BytesIO()
-    with pd.ExcelWriter(bio, engine='openpyxl') as w:
-        df.to_excel(w, index=False, sheet_name=sheet[:31])
-        ws = w.sheets[sheet[:31]]
-        for i, c in enumerate(df.columns, 1):
-            vals = [str(c)] + [str(v) for v in df[c].tolist()]
-            width = min(max(max(len(x) for x in vals) + 2, 8), 40)
-            ws.column_dimensions[ws.cell(1, i).column_letter].width = width
-    return bio.getvalue()
+    return sheets_to_xlsx([(sheet, df)])
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -2447,18 +2582,7 @@ def hit_records(results, K, live=None):
 
 def hits_excel_bytes(recs, sheet='命中組合股票'):
     df = pd.DataFrame(recs, columns=HIT_COLS)
-    bio = io.BytesIO()
-    with pd.ExcelWriter(bio, engine='openpyxl') as w:
-        df.to_excel(w, index=False, sheet_name=sheet)
-        ws = w.sheets[sheet]
-        from openpyxl.styles import Alignment
-        widths = {'A': 12, 'B': 10, 'C': 12, 'D': 10, 'E': 9, 'F': 80, 'G': 26, 'H': 26, 'I': 26, 'J': 22}
-        for col, wd in widths.items():
-            ws.column_dimensions[col].width = wd
-        for row in ws.iter_rows(min_row=2):
-            for c in row:
-                c.alignment = Alignment(wrap_text=True, vertical='top')
-    return bio.getvalue()
+    return sheets_to_xlsx([(sheet, df)], widths=[12, 10, 12, 10, 9, 80, 26, 26, 26, 22], wrap=True)
 
 
 def load_hit_log():
@@ -2597,10 +2721,8 @@ def run_daily(argv):
     perf = track_performance(load_hit_log(), a.token, delay=0.3)
     summ = combo_track_summary(perf, K)
     fn = os.path.join(a.out, f'命中組合_{dt.date.today()}.xlsx')
-    with pd.ExcelWriter(fn, engine='openpyxl') as w:
-        pd.DataFrame(recs, columns=HIT_COLS).to_excel(w, index=False, sheet_name='今日命中')
-        perf.to_excel(w, index=False, sheet_name='追蹤明細')
-        summ.to_excel(w, index=False, sheet_name='組合彙總')
+    with open(fn, 'wb') as f_:
+        f_.write(sheets_to_xlsx([('今日命中', pd.DataFrame(recs, columns=HIT_COLS)), ('追蹤明細', perf), ('組合彙總', summ)]))
     print(f'📥 已輸出 {fn}')
     return 0
 
@@ -2901,6 +3023,7 @@ def render_batch(st, ss, K):
                '營收MoM%(最新)', '均價YoY%(最新)', 'YoY乖離度(近3月合計)pp'] if c in view.columns}
     colcfg['量比'] = st.column_config.NumberColumn(format='%.2f')
     colcfg['漲跌幅%'] = st.column_config.NumberColumn(format='%.2f')
+    colcfg['股價'] = st.column_config.NumberColumn(format='%.2f')
     colcfg['成交量'] = st.column_config.NumberColumn(format='%d')
     if '三大法人(近3月合計)' in view.columns:
         colcfg['三大法人(近3月合計)'] = st.column_config.NumberColumn(format='%d')
@@ -3117,12 +3240,7 @@ def render_tracking(st, ss, K):
         summ = combo_track_summary(perf, K)
         st.caption('實盤勝率明顯低於回測記錄的組合，代表可能是過度適配，可考慮從指定組合移除；樣本少於10筆前先別下結論。')
         st.dataframe(summ, hide_index=True, use_container_width=True, height=380)
-        bio = io.BytesIO()
-        with pd.ExcelWriter(bio, engine='openpyxl') as w:
-            log.to_excel(w, index=False, sheet_name='命中紀錄')
-            perf.to_excel(w, index=False, sheet_name='追蹤明細')
-            summ.to_excel(w, index=False, sheet_name='組合彙總')
-        st.download_button('📥 匯出追蹤報表', bio.getvalue(), file_name=f'命中追蹤_{dt.date.today()}.xlsx', key='dl_track')
+        st.download_button('📥 匯出追蹤報表', sheets_to_xlsx([('命中紀錄', log), ('追蹤明細', perf), ('組合彙總', summ)]), file_name=f'命中追蹤_{dt.date.today()}.xlsx', key='dl_track')
     with st.expander('🗂️ 管理追蹤紀錄'):
         keep_days = st.number_input('只保留最近幾天的紀錄', 5, 3650, 120, 5, key='keep_days')
         if st.button('🧹 刪除更早的紀錄', key='prune_track'):
