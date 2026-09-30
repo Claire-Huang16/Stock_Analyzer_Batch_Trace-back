@@ -1185,7 +1185,7 @@ NEW_TECH_FLAGS = [
     ('newHigh52', '創52週新高', lambda s: s.eq(1)),
     ('high52Dist', '距52週高點≤5%', lambda s: s.ge(-5)),
     ('maBull', '均線多頭排列(5>20>60且站上月線)', lambda s: s.eq(1)),
-    ('bbwRank', '布林通道收窄(寬度近半年最低20%)', lambda s: s.le(20)),
+    # 布林通道收窄：2026-09-30 台股三年回測報酬低於基準，已移除（bbwRank 欄位仍保留）
     ('gapUp3', '近3日向上跳空缺口', lambda s: s.eq(1)),
 ]
 # 不放進「多因子複選搜尋／飆股搜尋」的條件（回測貢獻極低或與個別型態重複；指定組合比對與統計仍可使用）
@@ -1206,7 +1206,8 @@ def _period_masks(dates):
     span = (dt.date.fromisoformat(str(ud[-1])[:10]) - dt.date.fromisoformat(str(ud[0])[:10])).days
     k = 3 if span >= 540 and len(ud) >= 6 else 2
     cuts = [ud[len(ud) * i // k] for i in range(1, k)]
-    labels = ['前半', '後半'] if k == 2 else ['第1段', '第2段', '第3段']
+    # 三段的命名和「三年分三段」回測一致：第1段＝最近1年、第3段＝最早（欄位由舊到新排列）
+    labels = ['前半', '後半'] if k == 2 else ['第3段(最早)', '第2段', '第1段(最近)']
     parts = []
     for i in range(k):
         m = np.ones(len(dates), bool)
@@ -1719,8 +1720,10 @@ def fetch_price(sid, token, days):
     rows = j.get('data') or []
     if not rows:
         raise RuntimeError('無資料（可能代號錯誤）')
+    # FinMind 在暫停交易日可能回傳收盤價 0，會讓報酬被算成 -100%，這種日子直接略過
     out = [dict(date=str(r['date'])[:10], open=float(r['open']), high=float(r['max']), low=float(r['min']),
-                close=float(r['close']), volume=float(r['Trading_Volume'])) for r in rows]
+                close=float(r['close']), volume=float(r['Trading_Volume'])) for r in rows
+           if float(r.get('close') or 0) > 0 and float(r.get('max') or 0) > 0 and float(r.get('min') or 0) > 0]
     out.sort(key=lambda r: r['date'])
     return out
 
@@ -2708,7 +2711,7 @@ def combo_stats(combo, kind, K, live=None):
         return live[k]
     ref = K.get('COMBO_REF_STATS', {}).get(k, {})
     st_ = {'win': dict(ref.get('win', {})), 't': dict(ref.get('t', {})), 'moon': dict(ref.get('moon', {})),
-           'src': '2026-09-27回測' if ref else ''}
+           'src': '回測記錄值' if ref else ''}
     key = ' ＋ '.join(combo)
     if kind == 'S':
         for h, e in (K['STOCK_PICK_STATS'].get(key) or {}).items():
@@ -2822,7 +2825,7 @@ def track_performance(log_df, token, delay=0.3, progress=None):
     for r in log_df.to_dict('records'):
         rows = px.get(r['股票代號']) or []
         dates = [x['date'] for x in rows]
-        rec = {k: r[k] for k in ('日期', '股票代號', '股票名', '股價', '命中編號')}
+        rec = {k: r.get(k) for k in ('日期', '股票代號', '股票名', '股價', '命中編號', '命中組合')}
         import bisect
         k = bisect.bisect_right(dates, str(r['日期'])) - 1   # 命中日（或之前最近的交易日）
         if k < 0:
@@ -2848,19 +2851,35 @@ def combo_track_summary(perf, K):
         return pd.DataFrame()
     rows = []
     ex = perf.assign(編號=perf['命中編號'].fillna('').str.split()).explode('編號')
-    ex = ex[ex['編號'].astype(str).str.len() > 0]
-    for code, g in ex.groupby('編號'):
+    ex = ex[ex['編號'].astype(str).str.len() > 0].copy()
+
+    def cur_combo(code):
         idx = int(code[1:]) - 1
-        if code.startswith('S'):
-            combo = K['STOCK_PICK_COMBOS'][idx]
-            rec_txt = format_stockpick_stats(K['STOCK_PICK_STATS'].get(' ＋ '.join(combo)))
-        elif code.startswith('#'):
-            combo = K['PINNED_COMBOS'][idx]
-            rec_txt = ('[擇時型] ' if is_timing_combo(combo) else '') + format_winrates(K['PINNED_COMBO_WINRATES'].get(' ＋ '.join(combo)))
+        lst = K['STOCK_PICK_COMBOS'] if code.startswith('S') else K['PINNED_COMBOS'] if code.startswith('#') else K['MOONSHOT_COMBOS']
+        return lst[idx] if 0 <= idx < len(lst) else None
+
+    def logged_combo(code, txt):
+        """從追蹤紀錄當時寫下的「命中組合」文字取出這個編號的組合（清單改版後舊紀錄仍對得上）"""
+        for line in str(txt or '').split('\n'):
+            m = re.match(r'^' + re.escape(code) + r'\[[^\]]*\]\s*(.+?)(（t=.*）)?$', line.strip())
+            if m:
+                return m.group(1).strip()
+        return None
+    ex['_combo'] = [logged_combo(c, t) or ('＋'.join(cur_combo(c)) if cur_combo(c) else '') for c, t in
+                    zip(ex['編號'], ex['命中組合'] if '命中組合' in ex.columns else [None] * len(ex))]
+    for (code, ctext), g in ex.groupby(['編號', '_combo']):
+        combo = cur_combo(code)
+        if combo is None or '＋'.join(combo) != ctext:   # 清單已改版：顯示當時的組合，不套用現在的回測記錄
+            row_code, combo_txt, rec_txt = code + '(舊版)', ctext, '（舊版清單組合）'
         else:
-            combo = K['MOONSHOT_COMBOS'][idx]
-            rec_txt = format_moonshot_stats(K['MOONSHOT_COMBO_STATS'].get(' ＋ '.join(combo)))
-        row = {'編號': code, '條件組合': '＋'.join(combo), '命中次數': len(g),
+            row_code, combo_txt = code, ctext
+            if code.startswith('S'):
+                rec_txt = format_stockpick_stats(K['STOCK_PICK_STATS'].get(' ＋ '.join(combo)))
+            elif code.startswith('#'):
+                rec_txt = ('[擇時型] ' if is_timing_combo(combo) else '') + format_winrates(K['PINNED_COMBO_WINRATES'].get(' ＋ '.join(combo)))
+            else:
+                rec_txt = format_moonshot_stats(K['MOONSHOT_COMBO_STATS'].get(' ＋ '.join(combo)))
+        row = {'編號': row_code, '條件組合': combo_txt, '命中次數': len(g),
                '目前平均報酬%': round(g['目前報酬%'].mean(), 2) if g['目前報酬%'].notna().any() else None}
         for h in (5, 10, 20):
             v = g[f'{h}日報酬%'].dropna() if f'{h}日報酬%' in g else pd.Series(dtype=float)
@@ -3186,15 +3205,15 @@ def render_batch(st, ss, K):
     if live:
         st.caption('🧮 命中組合的 t值／勝率／飆股比例：使用本次程式內的回測即時計算（t值為同日調整，括號內為5/10/20日中最高的t）。')
     else:
-        st.caption('🧮 命中組合的 t值／勝率／飆股比例：尚未跑回測，先用 2026-09-27 台股回測的記錄值（沒進榜的組合沒有 t 值）；跑過回測或載入回測紀錄後會改用即時計算。')
+        st.caption('🧮 命中組合的 t值／勝率／飆股比例：尚未跑回測，先用回測記錄值（選股型 S 為 2023-10～2026-08 三年回測；沒進榜的組合沒有 t 值）；跑過回測或載入回測紀錄後會改用即時計算。')
     df = summary_frame(results, exf, K, live)
 
     with st.expander(f"「指定組合命中」編號對照：[選股型] S1~S{len(K['STOCK_PICK_COMBOS'])}　／　[高勝率] #1~#{len(K['PINNED_COMBOS'])}　／　[高標股] M1~M{len(K['MOONSHOT_COMBOS'])}"):
-        st.caption('S＝選股型：扣掉同一天大盤表現後仍有超額報酬（t≥3），最值得看。'
+        st.caption('S＝選股型：2023-10～2026-08 三年回測分三段（偏多／空頭／多頭），每一段扣掉同一天大盤後都仍有超額報酬（t≥2），最值得看。'
                    '#＝高勝率；標 ⏱ 的是擇時型（含布林低檔／大盤跌破均線），勝率主要來自大盤反彈，適合判斷大盤落底，不適合當選股依據。'
                    '⚠️ #、M 的歷史統計是舊版（VAH/VAL 分價量表、夜星未限高檔）時期記錄的。')
         t0 = pd.DataFrame([{'編號': f'S{i + 1}', '條件組合': '＋'.join(c),
-                            '回測記錄(2026-09-27)': format_stockpick_stats(K['STOCK_PICK_STATS'].get(' ＋ '.join(c)))}
+                            '回測記錄(三年，2026-09-30)': format_stockpick_stats(K['STOCK_PICK_STATS'].get(' ＋ '.join(c)))}
                            for i, c in enumerate(K['STOCK_PICK_COMBOS'])])
         st.dataframe(t0, hide_index=True, use_container_width=True)
         t1 = pd.DataFrame([{'編號': f'#{i + 1}', '類型': combo_type_label(c), '條件組合': '＋'.join(c),
@@ -3716,29 +3735,36 @@ TW0050_LIST = [
     "1216", "3045", "4904", "2379", "3034", "1102", "2610", "2618", "2603", "2609", "2615",
 ]
 
-# 選股型指定組合（S編號）：2026-09-27 台股回測，扣掉同日大盤後仍有超額報酬（同日調整 t≥3）
+# 選股型指定組合（S編號）：2023-10～2026-08 台股三年回測（分三段：偏多／空頭／多頭），三段的同日調整 t 值都 ≥2 的組合
+# （2026-09-30 改版；舊版 S1～S7 多數只在多頭年有效，已移除或改列高標股 M）
 STOCK_PICK_COMBOS = [
-    ["多方力道≥80", "強勢突破盤", "地量(≤0.5倍均量)"],
-    ["強勢突破盤", "地量(≤0.5倍均量)", "回後買上漲全通過"],
-    ["分價量表-突破POC追價買進", "突破飆股大量黑K最高點剛形成", "晨星剛形成"],
-    ["KDJ近3日內黃金交叉", "近3月均價YoY為正", "晨星剛形成"],
-    ["KDJ近3日內黃金交叉", "近3月乖離度為負(股價超前營收)", "晨星剛形成"],
-    ["KDJ近3日內黃金交叉", "母子懷抱(低檔)剛形成", "晨星剛形成"],
-    ["相對強弱為負(弱於大盤)", "大盤跌破60日均線", "母子懷抱(低檔)剛形成"],
+    ["距52週高點≤5%", "近3日向上跳空缺口", "近3月乖離度為正(營收優於股價)"],
+    ["創52週新高", "近3日向上跳空缺口", "近3月乖離度為正(營收優於股價)"],
+    ["相對強弱為正(強於大盤)", "量能區間低檔(≤10百分位)", "距52週高點≤5%"],
+    ["地量(≤0.5倍均量)", "近3日向上跳空缺口", "三大法人近3月買超"],
+    ["多方力道≥80", "三大法人近3月買超", "N字底剛形成"],
 ]
 STOCK_PICK_STATS = {
-    "多方力道≥80 ＋ 強勢突破盤 ＋ 地量(≤0.5倍均量)": {"20": {"n": 319, "win": 60.2, "ret": 11.48, "ex": 10.12, "t": 6.52}},
-    "強勢突破盤 ＋ 地量(≤0.5倍均量) ＋ 回後買上漲全通過": {"20": {"n": 83, "win": 61.4, "ret": 12.25, "ex": 10.89, "t": 3.04}},
-    "分價量表-突破POC追價買進 ＋ 突破飆股大量黑K最高點剛形成 ＋ 晨星剛形成": {"5": {"n": 59, "win": 66.1, "ret": 6.01, "ex": 5.26, "t": 3.55}},
-    "KDJ近3日內黃金交叉 ＋ 近3月均價YoY為正 ＋ 晨星剛形成": {"10": {"n": 867, "win": 60.2, "ret": 3.65, "ex": 1.46, "t": 3.48}},
-    "KDJ近3日內黃金交叉 ＋ 近3月乖離度為負(股價超前營收) ＋ 晨星剛形成": {"10": {"n": 684, "win": 60.4, "ret": 3.55, "ex": 1.53, "t": 3.29}},
-    "KDJ近3日內黃金交叉 ＋ 母子懷抱(低檔)剛形成 ＋ 晨星剛形成": {"20": {"n": 374, "win": 60.4, "ret": 6.64, "ex": 2.64, "t": 3.03}},
-    "相對強弱為負(弱於大盤) ＋ 大盤跌破60日均線 ＋ 母子懷抱(低檔)剛形成": {"5": {"n": 498, "win": 61.4, "ret": 1.4, "ex": 0.45, "t": 1.57}, "10": {"n": 498, "win": 67.3, "ret": 3.1, "ex": 1.07, "t": 2.74}, "20": {"n": 498, "win": 63.7, "ret": 5.29, "ex": 1.71, "t": 3.07}},
+    "距52週高點≤5% ＋ 近3日向上跳空缺口 ＋ 近3月乖離度為正(營收優於股價)": {"10": {"n": 3898, "win": 54.4, "ret": 3.23, "ex": 2.63, "t": 12.04}, "20": {"n": 3898, "win": 54.5, "ret": 5.06, "ex": 3.63, "t": 11.73}},
+    "創52週新高 ＋ 近3日向上跳空缺口 ＋ 近3月乖離度為正(營收優於股價)": {"10": {"n": 2708, "win": 53.3, "ret": 3.64, "ex": 3.03, "t": 10.35}, "20": {"n": 2708, "win": 52.7, "ret": 5.39, "ex": 3.96, "t": 9.53}},
+    "相對強弱為正(強於大盤) ＋ 量能區間低檔(≤10百分位) ＋ 距52週高點≤5%": {"10": {"n": 638, "win": 58.0, "ret": 2.32, "ex": 2.17, "t": 6.16}, "20": {"n": 638, "win": 56.4, "ret": 3.46, "ex": 2.27, "t": 4.85}},
+    "地量(≤0.5倍均量) ＋ 近3日向上跳空缺口 ＋ 三大法人近3月買超": {"10": {"n": 2944, "win": 54.8, "ret": 2.71, "ex": 1.52, "t": 6.77}, "20": {"n": 2941, "win": 54.5, "ret": 4.17, "ex": 1.97, "t": 5.78}},
+    "多方力道≥80 ＋ 三大法人近3月買超 ＋ N字底剛形成": {"10": {"n": 988, "win": 52.3, "ret": 2.83, "ex": 2.32, "t": 5.41}, "20": {"n": 988, "win": 49.2, "ret": 4.09, "ex": 2.84, "t": 4.74}},
 }
 
 # 2026-09-27 台股回測（勝率榜5/10/20日＋飆股榜5/10/20日）中，指定組合的勝率／t值(同日調整)／飆股比例記錄值
 # key＝條件依字元排序後以「 ＋ 」連接
 COMBO_REF_STATS = {
+    # ── 2026-09-30 三年回測（2023-10～2026-08）新增組合的記錄值 ──
+    "距52週高點≤5% ＋ 近3日向上跳空缺口 ＋ 近3月乖離度為正(營收優於股價)": {"win": {"5": 52.6, "10": 54.4, "20": 54.5}, "t": {"5": 9.27, "10": 12.04, "20": 11.73}, "moon": {"10": 4.8, "20": 9.3}},
+    "創52週新高 ＋ 近3日向上跳空缺口 ＋ 近3月乖離度為正(營收優於股價)": {"win": {"5": 52.1, "10": 53.3, "20": 52.7}, "t": {"5": 7.24, "10": 10.35, "20": 9.53}, "moon": {"10": 6.4, "20": 11.5}},
+    "相對強弱為正(強於大盤) ＋ 距52週高點≤5% ＋ 量能區間低檔(≤10百分位)": {"win": {"5": 58.5, "10": 58.0, "20": 56.4}, "t": {"5": 5.47, "10": 6.16, "20": 4.85}, "moon": {"10": 1.3, "20": 4.7}},
+    "三大法人近3月買超 ＋ 地量(≤0.5倍均量) ＋ 近3日向上跳空缺口": {"win": {"5": 53.2, "10": 54.8, "20": 54.5}, "t": {"5": 5.07, "10": 6.77, "20": 5.78}, "moon": {"10": 3.7, "20": 7.3}},
+    "N字底剛形成 ＋ 三大法人近3月買超 ＋ 多方力道≥80": {"win": {"5": 49.9, "10": 52.3, "20": 49.2}, "t": {"5": 4.7, "10": 5.41, "20": 4.74}, "moon": {"10": 5.7, "20": 9.9}},
+    "地量(≤0.5倍均量) ＋ 多方力道≥80 ＋ 強勢突破盤": {"win": {"5": 54.8, "10": 57.5, "20": 60.1}, "t": {"5": 4.13, "10": 4.91, "20": 6.07}, "moon": {"10": 11.0, "20": 20.9}},
+    "多方力道≥80 ＋ 晨星剛形成 ＋ 量能斜率轉弱(近5日均量<近10日均量20%以上)": {"win": {"5": 47.0, "10": 48.7, "20": 49.6}, "t": {"5": 1.9, "10": 1.67, "20": 2.17}, "moon": {"10": 10.4, "20": 20.9}},
+    "創52週新高 ＋ 地量(≤0.5倍均量) ＋ 近3日向上跳空缺口": {"win": {"5": 55.4, "10": 55.7, "20": 57.5}, "t": {"5": 4.63, "10": 5.41, "20": 5.27}, "moon": {"10": 11.7, "20": 19.3}},
+    "大盤跌破60日均線 ＋ 相對強弱為負(弱於大盤) ＋ 近3日向上跳空缺口": {"win": {"5": 57.6, "10": 71.1, "20": 72.9}, "t": {"5": 0.2, "10": 4.87, "20": 7.35}, "moon": {"10": 0.7, "20": 4.3}},
     "KDJ近3日內死亡交叉 ＋ KDJ近3日內黃金交叉 ＋ 夜星剛形成": {"moon": {"20": 10.5}},
     "KDJ近3日內死亡交叉 ＋ K線橫盤的突破剛形成 ＋ 晨星剛形成": {"moon": {"20": 15.3}},
     "KDJ近3日內死亡交叉 ＋ K線橫盤的突破剛形成 ＋ 母子懷抱(低檔)剛形成": {"moon": {"10": 11.5, "20": 23.1}},
@@ -4688,6 +4714,8 @@ PINNED_COMBOS = [
     ["跌深反彈盤", "爆量(≥1.5倍均量)", "三大法人近3月賣超"],
     ["布林通道低檔(≤20%)", "大盤跌破60日均線", "近3月均價YoY為正"],
     ["相對強弱為正(強於大盤)", "N字底剛形成", "一字底(均線糾結)剛形成"],
+    # 2026-09-30 三年回測：大盤跌深時弱勢股開始跳空上漲（擇時型，三段 t 都 ≥2）
+    ["相對強弱為負(弱於大盤)", "大盤跌破60日均線", "近3日向上跳空缺口"],
 ]
 
 PINNED_COMBO_WINRATES = {
@@ -4948,6 +4976,7 @@ PINNED_COMBO_WINRATES = {
     "跌深反彈盤 ＋ 爆量(≥1.5倍均量) ＋ 三大法人近3月賣超": {"20": 60},
     "布林通道低檔(≤20%) ＋ 大盤跌破60日均線 ＋ 近3月均價YoY為正": {"20": 60},
     "相對強弱為正(強於大盤) ＋ N字底剛形成 ＋ 一字底(均線糾結)剛形成": {"20": 60},
+    "相對強弱為負(弱於大盤) ＋ 大盤跌破60日均線 ＋ 近3日向上跳空缺口": {"5": 57.6, "10": 71.1, "20": 72.9},
 }
 
 # 高標股指定組合（M編號）與歷史飆股統計記錄
@@ -5675,6 +5704,10 @@ MOONSHOT_COMBOS = [
     ["大盤站上60日均線", "回後買上漲全通過", "晨星剛形成"],
     ["回後買上漲全通過", "N字底剛形成", "晨星剛形成"],
     ["近3月乖離度為正(營收優於股價)", "突破ABC修正下降切線剛形成", "晨星剛形成"],
+    # 2026-09-30 三年回測：20日飆股比例三段都 ≥2 倍基準（舊版選股型 S1 移到這裡）
+    ["多方力道≥80", "強勢突破盤", "地量(≤0.5倍均量)"],
+    ["多方力道≥80", "量能斜率轉弱(近5日均量<近10日均量20%以上)", "晨星剛形成"],
+    ["地量(≤0.5倍均量)", "創52週新高", "近3日向上跳空缺口"],
 ]
 
 MOONSHOT_COMBO_STATS = {
@@ -6400,6 +6433,9 @@ MOONSHOT_COMBO_STATS = {
     "大盤站上60日均線 ＋ 回後買上漲全通過 ＋ 晨星剛形成": {"20": {"n": 279, "moonshotN": 28, "pct": 10, "avg": 51.7}},
     "回後買上漲全通過 ＋ N字底剛形成 ＋ 晨星剛形成": {"20": {"n": 50, "moonshotN": 5, "pct": 10, "avg": 57.7}},
     "近3月乖離度為正(營收優於股價) ＋ 突破ABC修正下降切線剛形成 ＋ 晨星剛形成": {"20": {"n": 60, "moonshotN": 6, "pct": 10, "avg": 43.4}},
+    "多方力道≥80 ＋ 強勢突破盤 ＋ 地量(≤0.5倍均量)": {"10": {"n": 301, "moonshotN": 33, "pct": 11.0, "avg": 46.4}, "20": {"n": 301, "moonshotN": 63, "pct": 20.9, "avg": 55.5}},
+    "多方力道≥80 ＋ 量能斜率轉弱(近5日均量<近10日均量20%以上) ＋ 晨星剛形成": {"10": {"n": 115, "moonshotN": 12, "pct": 10.4, "avg": 44.4}, "20": {"n": 115, "moonshotN": 24, "pct": 20.9, "avg": 49.2}},
+    "地量(≤0.5倍均量) ＋ 創52週新高 ＋ 近3日向上跳空缺口": {"10": {"n": 359, "moonshotN": 42, "pct": 11.7, "avg": 44.9}, "20": {"n": 358, "moonshotN": 69, "pct": 19.3, "avg": 57.6}},
 }
 
 
