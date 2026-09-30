@@ -40,6 +40,10 @@ from itertools import combinations
 
 import numpy as np
 import pandas as pd
+try:   # pandas 2.x：開啟 Copy-on-Write，改欄位時不必整張表複製（pandas 3 預設就是）
+    pd.set_option('mode.copy_on_write', True)
+except Exception:  # noqa
+    pass
 import requests
 
 # ────────────────────────────────────────────────────────────────────
@@ -1070,6 +1074,46 @@ def vp_signal(b: Bars, e, prof, p=None):
 PH_FIELDS = ['ph_' + pid for pid, _ in PATTERN_DEFS] + ['ph_pbup']
 
 
+
+# ── 新增技術面欄位（2026-09-30）：52週高點、均線多頭排列、布林收窄、向上跳空 ──
+LONG_HISTORY_DAYS = 400   # 52週高點需要約250根K棒；批次分析會多抓到400天只用來算這幾個欄位
+
+
+def tech_extras(b, e):
+    """52週高點距離／創新高、均線多頭排列、布林寬度在近半年的百分位、近3日向上跳空。資料不足時為 None"""
+    out = dict(high52Dist=None, newHigh52=None, maBull=None, bbwRank=None, gapUp3=None)
+    if e < 0 or e >= b.n:
+        return out
+    if e >= 249:
+        mx = max(b.high[e - 249:e + 1])
+        prev = max(b.high[e - 249:e])
+        out['high52Dist'] = (b.close[e] / mx - 1) * 100 if mx > 0 else None
+        out['newHigh52'] = int(b.high[e] > prev)
+    m5, m20, m60 = b.ma5[e], b.ma20[e], b.ma60[e]
+    if None not in (m5, m20, m60):
+        out['maBull'] = int(m5 > m20 > m60 and b.close[e] > m20)
+
+    def bw(i):
+        u, l = b.bbU[i], b.bbL[i]
+        if u is None or l is None or (u + l) <= 0:
+            return None
+        return (u - l) / ((u + l) / 2)
+    cur = bw(e)
+    if cur is not None and e >= 119:
+        ws = [w for w in (bw(i) for i in range(e - 119, e + 1)) if w is not None]
+        if len(ws) >= 100:
+            out['bbwRank'] = sum(1 for w in ws if w <= cur) / len(ws) * 100
+    if e >= 3:
+        out['gapUp3'] = int(any(b.low[e - k] > b.high[e - k - 1] for k in range(3)))
+    return out
+
+
+def trim_rows(rows, days):
+    """只保留最近 days 天（和直接抓 days 天的結果相同）"""
+    cut = (dt.date.today() - dt.timedelta(days=days)).isoformat()
+    return [r for r in rows if r['date'] >= cut]
+
+
 def build_flag_row(b: Bars, e, bm, pc: PatternCache, vp_params=None, extras=None):
     """回傳 (row, info)：row 是回測／條件旗標用的欄位，info 是批次表格顯示用的明細"""
     vpp = vp_params or VP_DEFAULTS
@@ -1107,6 +1151,7 @@ def build_flag_row(b: Bars, e, bm, pc: PatternCache, vp_params=None, extras=None
     row['priceYoy3m'] = ex.get('priceYoy3m')
     row['inst3m'] = ex.get('inst3m')
     row['confluenceCount'] = confluence_count(row)
+    row.update((extras or {}).get('tech') or tech_extras(b, e))
     info = dict(dm=dm, sig=sig, pb=pb, pt=pt, prof=prof, vps=vps, rs=rs, vr=vr)
     return row, info
 
@@ -1133,6 +1178,53 @@ def confluence_count(r):
 # ────────────────────────────────────────────────────────────────────
 def _col(df, c):
     return df[c] if c in df.columns else pd.Series(np.nan, index=df.index)
+
+
+# 新增的技術面條件旗標（欄位, 名稱, 判斷式）
+NEW_TECH_FLAGS = [
+    ('newHigh52', '創52週新高', lambda s: s.eq(1)),
+    ('high52Dist', '距52週高點≤5%', lambda s: s.ge(-5)),
+    ('maBull', '均線多頭排列(5>20>60且站上月線)', lambda s: s.eq(1)),
+    ('bbwRank', '布林通道收窄(寬度近半年最低20%)', lambda s: s.le(20)),
+    ('gapUp3', '近3日向上跳空缺口', lambda s: s.eq(1)),
+]
+# 不放進「多因子複選搜尋／飆股搜尋」的條件（回測貢獻極低或與個別型態重複；指定組合比對與統計仍可使用）
+SEARCH_EXCLUDE_FLAGS = {'型態成形中', '型態突破確認', '型態剛形成(剛突破)', '突破上升軌道線剛形成',
+                        '分價量表-守穩POC買進', '分價量表-突破POC追價買進', '分價量表-反彈POC遇壓賣出', '分價量表-破位停損賣出'}
+
+
+def search_flags(df):
+    return {k: v for k, v in build_condition_flags(df).items() if k not in SEARCH_EXCLUDE_FLAGS}
+
+
+def _period_masks(dates):
+    """資料跨度 ≥18個月切三段（配合「三年分三次回測」合併後逐段驗證），否則切前後兩半；同一天不會被切開。
+    回傳 ([(段名, 布林遮罩), ...], 說明文字)"""
+    ud = np.unique(dates)
+    if len(ud) < 4:
+        return [], ''
+    span = (dt.date.fromisoformat(str(ud[-1])[:10]) - dt.date.fromisoformat(str(ud[0])[:10])).days
+    k = 3 if span >= 540 and len(ud) >= 6 else 2
+    cuts = [ud[len(ud) * i // k] for i in range(1, k)]
+    labels = ['前半', '後半'] if k == 2 else ['第1段', '第2段', '第3段']
+    parts = []
+    for i in range(k):
+        m = np.ones(len(dates), bool)
+        if i > 0:
+            m &= dates >= cuts[i - 1]
+        if i < k - 1:
+            m &= dates < cuts[i]
+        parts.append((labels[i], m))
+    desc = (f'前後半段以 {cuts[0]} 為界' if k == 2 else f'依評估日分三段（以 {cuts[0]}、{cuts[1]} 為界）')
+    return parts, desc
+
+
+def _t_of(ex):
+    n = len(ex)
+    if n < 5:
+        return None
+    sd = ex.std(ddof=1)
+    return round(float(ex.mean() / (sd / math.sqrt(n))), 2) if sd > 0 else None
 
 
 def build_condition_flags(df: pd.DataFrame):
@@ -1188,6 +1280,9 @@ def build_condition_flags(df: pd.DataFrame):
         F['型態剛形成(剛突破)'] = eq1('patternJustBroke')
     if has('pbAllPass'):
         F['回後買上漲全通過'] = eq1('pbAllPass')
+    for fld, lbl, fn in NEW_TECH_FLAGS:
+        if has(fld):
+            F[lbl] = fn(df[fld])
     if has('divTotal'):
         F['近3月乖離度為正(營收優於股價)'] = df['divTotal'].gt(0)
         F['近3月乖離度為負(股價超前營收)'] = df['divTotal'].lt(0)
@@ -1239,6 +1334,20 @@ def tag_hitrate(df, field, label):
 
 def baseline_row(df):
     return pd.DataFrame([stat_row('標記', '全體基準', df)])
+
+
+def new_tech_table(df):
+    rows = []
+    flg = build_condition_flags(df)
+    for fld, lbl, _ in NEW_TECH_FLAGS:
+        if lbl not in flg or fld not in df.columns:
+            continue
+        ok = df[fld].notna().values
+        yes = flg[lbl].values & ok
+        for nm, m in (('是', yes), ('否', ok & ~yes)):
+            if m.sum():
+                rows.append(stat_row('條件', f'{lbl}＝{nm}', df[m]))
+    return pd.DataFrame(rows)
 
 
 def pattern_hits(df):
@@ -1303,7 +1412,7 @@ def combo_search(df, h, max_size=3, min_samples=50, min_winrate=50.0, skip_redun
     col = f'ret{h}d'
     valid = df[col].notna().values
     v = df[valid].reset_index(drop=True)
-    flags = {kk: pd.Series(ff.values[valid]) for kk, ff in build_condition_flags(df).items()}
+    flags = {kk: pd.Series(ff.values[valid]) for kk, ff in search_flags(df).items()}
     names, M = _flag_matrix(v, flags)
     k = len(names)
     if not len(v) or not k:
@@ -1375,6 +1484,9 @@ def combo_search(df, h, max_size=3, min_samples=50, min_winrate=50.0, skip_redun
                             continue
                         consider((i, j, l), n, s2[l], int(w2[l]))
     rows = []
+    # 前後半段驗證：依評估日切兩半，各自算同日調整 t 值；兩段都 ≥2 才比較像真訊號、不是某段行情的巧合
+    parts, pdesc = _period_masks(v['evalDate'].astype(str).values) if 'evalDate' in v.columns else ([], '')
+    base['parts'] = pdesc
     for combo, n, s, wr in hitsz[1] + hitsz[2] + hitsz[3]:
         m = np.all(M[:, list(combo)], axis=1)
         r = ret[m]
@@ -1387,6 +1499,12 @@ def combo_search(df, h, max_size=3, min_samples=50, min_winrate=50.0, skip_redun
                      f'{h}日平均報酬%': round(avg, 2), f'{h}日勝率%': round(wr, 1),
                      '同日超額報酬%': round(exm, 2), '中位數報酬%': round(float(np.median(r)), 2),
                      't值(同日調整)': round(t, 2) if not math.isnan(t) else None})
+        if parts:
+            ts = [_t_of(exr[m & pm]) for _, pm in parts]
+            ok = [x is not None and x >= 2 for x in ts]
+            for (lbl, _), t_ in zip(parts, ts):
+                rows[-1][f't值({lbl})'] = t_
+            rows[-1]['各段一致'] = '✅' if all(ok) else (f'⚠️{sum(ok)}/{len(ok)}' if any(ok) else '')
     out = pd.DataFrame(rows)
     if len(out):
         if sort_by == 't':   # 依同日調整t值排序：優先列出「真的比同一天其他股票強」的選股型組合
@@ -1400,7 +1518,7 @@ def moonshot_search(df, h, threshold=30.0, max_size=3, min_samples=20, min_pct=1
     col = f'ret{h}d'
     valid = df[col].notna().values
     v = df[valid].reset_index(drop=True)
-    flags = {kk: pd.Series(ff.values[valid]) for kk, ff in build_condition_flags(df).items()}
+    flags = {kk: pd.Series(ff.values[valid]) for kk, ff in search_flags(df).items()}
     names, M = _flag_matrix(v, flags)
     k = len(names)
     if not len(v) or not k:
@@ -1460,6 +1578,8 @@ def moonshot_search(df, h, threshold=30.0, max_size=3, min_samples=20, min_pct=1
                             continue
                         consider((i, j, l), n, int(m2[l]))
     rows = []
+    parts, pdesc = _period_masks(v['evalDate'].astype(str).values) if 'evalDate' in v.columns else ([], '')
+    base['parts'] = pdesc
     for combo, n, mn in hitsz[1] + hitsz[2] + hitsz[3]:
         m = np.all(M[:, list(combo)], axis=1)
         r = ret[m & moon]
@@ -1467,6 +1587,10 @@ def moonshot_search(df, h, threshold=30.0, max_size=3, min_samples=20, min_pct=1
         rows.append({'條件組合': ' ＋ '.join(names[i] for i in combo), '條件數': len(combo), '樣本數': n,
                      '飆股次數': mn, '飆股比例%': round(pct, 1), '飆股平均漲幅%': round(r.mean(), 1),
                      '倍數(vs基準)': round(pct / base['pct'], 2) if base['pct'] > 0 else None})
+        if parts:
+            for lbl, hm in parts:
+                nn = int((m & hm).sum())
+                rows[-1][f'飆股比例({lbl})%'] = round((m & hm & moon).sum() / nn * 100, 1) if nn else None
     out = pd.DataFrame(rows)
     if len(out):
         out = out.sort_values('飆股比例%', ascending=False, kind='mergesort').reset_index(drop=True)
@@ -1895,6 +2019,8 @@ def inst3m_asof(daily, asof):
 #  歷史回測
 # ════════════════════════════════════════════════════════════════════
 def add_derived(df):
+    if df.attrs.get('derived'):
+        return df
     df = df.copy()
 
     def b01(s, cond):
@@ -1911,19 +2037,86 @@ def add_derived(df):
     return df
 
 
+
+def store_bt_df(df):
+    """回測資料存進 session 前先整理一次：衍生欄位只算一次、數值轉 float32、代號／名稱轉 category，
+    全美股約20萬筆時可省下大半記憶體（Streamlit Cloud 記憶體上限約 1GB，超過會整個 App 當掉）"""
+    if df is None or not len(df):
+        return df
+    df = add_derived(df)
+    for c in df.columns:
+        if c in ('evalDate', 'stockId', 'name'):
+            continue
+        if (pd.api.types.is_float_dtype(df[c]) or pd.api.types.is_integer_dtype(df[c])) and df[c].dtype != np.float32:
+            df[c] = df[c].astype(np.float32)
+    for c in ('stockId', 'name'):
+        if c in df.columns and not isinstance(df[c].dtype, pd.CategoricalDtype):
+            df[c] = df[c].astype(str).astype('category')
+    df['evalDate'] = df['evalDate'].astype(str)
+    df.attrs['derived'] = True
+    return df
+
+
+def bt_memo(ss, name, params, fn):
+    """回測分析結果快取（存在 session）：同一份回測資料、同樣參數只算一次，
+    改任何一個選單時 Streamlit 會整頁重跑，沒有快取的話每次都要重算幾十秒。"""
+    df = ss.get('bt_df')
+    sig = (id(df), len(df) if df is not None else 0)
+    memo = ss.get('_bt_memo')
+    if memo is None or memo.get('_sig') != sig:
+        memo = {'_sig': sig}
+        ss['_bt_memo'] = memo
+    key = (name,) + tuple(params)
+    if key not in memo:
+        memo[key] = fn()
+    return memo[key]
+
+
+def bt_csv_gz(df):
+    import gzip
+    buf = io.BytesIO()
+    with gzip.GzipFile(fileobj=buf, mode='wb', compresslevel=5) as gz:
+        with io.TextIOWrapper(gz, encoding='utf-8-sig', newline='') as tw:
+            df.to_csv(tw, index=False, float_format='%.9g')   # float32 需要9位有效數字才能原值還原
+    return buf.getvalue()
+
+
+def load_bt_files(files):
+    """一次載入一個或多個回測原始紀錄檔（例如三年分三段各一個），合併後去除重複（同日同檔）"""
+    parts = []
+    for f in files:
+        if hasattr(f, 'seek'):
+            f.seek(0)
+        d = pd.read_csv(f, compression='gzip' if f.name.endswith('.gz') else None, dtype={'stockId': str})
+        for c in d.columns:   # 先逐檔轉 float32，合併時記憶體高峰較低
+            if c not in ('evalDate', 'stockId', 'name') and (pd.api.types.is_float_dtype(d[c]) or pd.api.types.is_integer_dtype(d[c])):
+                d[c] = d[c].astype(np.float32)
+        d['evalDate'] = d['evalDate'].astype(str)
+        parts.append(d)
+    df = pd.concat(parts, ignore_index=True) if len(parts) > 1 else parts[0]
+    del parts
+    if len(files) > 1:
+        df = df.drop_duplicates(['evalDate', 'stockId'], keep='last').sort_values(['evalDate', 'stockId']).reset_index(drop=True)
+    return store_bt_df(df)
+
+
+BT_SEG_OPTIONS = ['自訂月數', '三年分三段・第1段（最近1年）', '三年分三段・第2段（1～2年前）', '三年分三段・第3段（2～3年前）']
+
 def run_backtest(token, universe, months_back, include_div, include_inst, min_liq, vp_params,
-                 delay=0.3, on_progress=None, should_stop=None):
+                 delay=0.3, on_progress=None, should_stop=None, end_offset_months=0):
     name_map = fetch_name_map(token)
+    off = int(end_offset_months or 0)   # 分段回測：評估區間往前推 off 個月（例：第2段＝1～2年前）
     buf = 60
     maxh = max(HORIZONS)
-    price_days = months_back * 30 + buf + maxh + 10 + (400 if include_div else 0)
+    price_days = (months_back + off) * 30 + buf + maxh + 10 + 400   # +400天：52週高點、布林收窄需要約一年歷史（營收乖離也夠用）
     try:
         bm = fetch_benchmark(token, price_days)
     except Exception:  # noqa
         bm = None
-    rev_days = months_back * 30 + 400
-    inst_days = months_back * 30 + 100
-    win_start = _ds(dt.date.today() - dt.timedelta(days=months_back * 30))
+    rev_days = (months_back + off) * 30 + 400
+    inst_days = (months_back + off) * 30 + 100
+    win_start = _ds(dt.date.today() - dt.timedelta(days=(months_back + off) * 30))
+    win_end = _ds(dt.date.today() - dt.timedelta(days=off * 30)) if off else None
     records = []
     saved = failed = 0
     total = len(universe)
@@ -1956,7 +2149,7 @@ def run_backtest(token, universe, months_back, include_div, include_inst, min_li
             nm = name_map.get(sid, sid)
             for e in range(buf, ev_end):
                 ds = b.date[e]
-                if ds < win_start:
+                if ds < win_start or (win_end and ds >= win_end):
                     continue
                 if min_liq > 0:
                     s0 = max(0, e - 19)
@@ -1999,7 +2192,7 @@ def run_backtest(token, universe, months_back, include_div, include_inst, min_li
 def analyze_stock(sid, name, rows, bm, vp_params, extras_data):
     b = Bars(rows)
     e = b.n - 1
-    ex = {}
+    ex = {'tech': extras_data.get('tech')}
     rv, py_ = extras_data.get('revRange'), extras_data.get('priceYoYRange')
     if rv and py_:
         pxk = {(p['year'], p['month']): p for p in py_}
@@ -2417,12 +2610,14 @@ def batch_analyze(stocks, token, days, use_rt, ex_flags, vpp, delay=0.6, log=Non
     results = []
     for i, sid in enumerate(stocks):
         try:
-            rows = fetch_price(sid, token, days)
+            rows_full = fetch_price(sid, token, max(days, LONG_HISTORY_DAYS))
             rt = False
             if use_rt and sid in rt_map:
-                rows, rt = merge_realtime(rows, rt_map[sid])
+                rows_full, rt = merge_realtime(rows_full, rt_map[sid])
+            rows = trim_rows(rows_full, days)
+            bl = Bars(rows_full)
             extras = dict(realtime=rt, peRange=None, revRange=None, priceYoYRange=None,
-                          instRange=None, instRangeErr=None)
+                          instRange=None, instRangeErr=None, tech=tech_extras(bl, bl.n - 1))
             if ex_flags.get('pe'):
                 try:
                     extras['peRange'] = fetch_pe_range(sid, token)
@@ -2864,18 +3059,29 @@ def main():
         st.divider()
         st.markdown('**🔬 歷史回測分析**')
         bt_univ = st.selectbox('回測股票池', ['上市清單', '上櫃清單', '上市+上櫃', '目前輸入框清單'], key='bt_univ')
-        bt_months = st.number_input('回測天數（月）', 1, 36, 3, 1, key='bt_months')
+        bt_seg = st.selectbox('回測期間', BT_SEG_OPTIONS, key='bt_seg',
+                              help='三年一次跑完資料量太大（容易記憶體不足當掉），改成分三次：每次跑一年，各自下載原始紀錄檔，最後三個檔一起載入合併分析')
+        if bt_seg == BT_SEG_OPTIONS[0]:
+            bt_months = st.number_input('回測天數（月）', 1, 36, 3, 1, key='bt_months')
+            bt_off = 0
+        else:
+            bt_months, bt_off = 12, (BT_SEG_OPTIONS.index(bt_seg) - 1) * 12
+            st.caption(f'本次評估區間：{bt_off}～{bt_off + 12} 個月前。每段跑完到「🔬 歷史回測」分頁按「產生回測原始紀錄檔」下載；'
+                       '三段都下載後，三個檔一起拖進下方「載入」即可合併分析，多因子／飆股搜尋會自動逐段（第1／2／3段）驗證。')
         bt_div = st.checkbox('📈 近3月YoY乖離度（股價歷史要抓超過1年）', key='bt_div')
         bt_inst = st.checkbox('🏦 三大法人買賣超（近3月）', key='bt_inst')
         bt_liq = st.number_input('最低近20日均成交金額（萬元，0＝不篩）', 0, 1000000, 0, 100, key='bt_liq')
         bt_delay = st.number_input('回測每檔間隔秒數', 0.0, 5.0, 0.3, 0.1, key='bt_delay')
         run_bt = st.button('🔬 執行歷史回測', use_container_width=True, key='run_bt')
-        up = st.file_uploader('或載入先前匯出的回測原始紀錄（.csv / .csv.gz）', type=['csv', 'gz'])
-        if up is not None and ss.get('bt_loaded_name') != up.name:
+        ups = st.file_uploader('或載入先前匯出的回測原始紀錄（.csv / .csv.gz，可一次選多個檔合併，例如三段各一個）',
+                               type=['csv', 'gz'], accept_multiple_files=True)
+        up_sig = tuple(sorted((u.name, u.size) for u in ups)) if ups else None
+        if up_sig and ss.get('bt_loaded_name') != up_sig:
             try:
-                ss['bt_df'] = pd.read_csv(up, compression='gzip' if up.name.endswith('.gz') else None,
-                                          dtype={'stockId': str})
-                ss['bt_loaded_name'] = up.name
+                with st.spinner(f'載入 {len(ups)} 個檔案中…'):
+                    ss['bt_df'] = load_bt_files(ups)
+                ss['bt_loaded_name'] = up_sig
+                ss['bt_seg_label'] = ''
             except Exception as ex:  # noqa
                 st.error(f'讀取失敗：{ex}')
 
@@ -2937,12 +3143,13 @@ def main():
 
             def onp(i, total, saved, failed, sid):
                 prog.progress(min(1.0, i / max(total, 1)),
-                              text=f'🔬 歷史回測執行中（過去{bt_months}個月）：{i} / {total}')
+                              text=f'🔬 歷史回測執行中（{bt_seg if bt_seg != BT_SEG_OPTIONS[0] else f"過去{bt_months}個月"}）：{i} / {total}')
                 det.caption((f'目前：{sid}　' if sid else '完成　') + f'已存 {saved:,} 筆　失敗 {failed} 檔')
             df, stt = run_backtest(token, univ, int(bt_months), bt_div, bt_inst, bt_liq * 10000, vpp,
-                                   delay=bt_delay, on_progress=onp)
+                                   delay=bt_delay, on_progress=onp, end_offset_months=bt_off)
+            ss['bt_seg_label'] = '' if bt_seg == BT_SEG_OPTIONS[0] else bt_seg.split('・')[1][:3]
             prog.empty()
-            ss['bt_df'] = df
+            ss['bt_df'] = store_bt_df(df)
             ss['bt_loaded_name'] = None
             det.caption(f"回測完成：{stt['saved']:,} 筆評估紀錄，失敗 {stt['failed']} 檔")
 
@@ -3258,13 +3465,21 @@ def render_backtest(st, ss, K):
         st.info('點擊左側「🔬 執行歷史回測」，或載入先前匯出的回測原始紀錄。')
         return
     df = add_derived(df)
-    dates = sorted(df['evalDate'].astype(str))
+    d0, d1 = str(df['evalDate'].min()), str(df['evalDate'].max())
     st.subheader('🔬 歷史回測分析結果')
-    st.caption(f"共 {len(df):,} 筆評估紀錄（{dates[0]} ～ {dates[-1]}），{df['stockId'].nunique()} 檔股票")
-    csv = df.to_csv(index=False).encode('utf-8-sig')
-    import gzip
-    st.download_button('💾 匯出回測原始紀錄（之後可直接載入，不用重抓）', gzip.compress(csv),
-                       file_name=f'回測原始紀錄_{dt.date.today()}.csv.gz')
+    st.caption(f"共 {len(df):,} 筆評估紀錄（{d0} ～ {d1}），{df['stockId'].nunique()} 檔股票")
+    if len(df) > 450_000:
+        st.warning(f'⚠️ 資料量 {len(df):,} 筆偏大，Streamlit Cloud（記憶體約1GB）可能跑不動而當掉。'
+                   '可以先只載入其中兩段，或回測時提高流動性門檻／最低股價減少筆數。')
+    # 原始紀錄檔按了才產生（全美股約20萬筆，每次重跑都先壓一次檔會多花十幾秒和幾百MB記憶體）
+    if ss.get('_bt_csv_sig') == id(ss.get('bt_df')) and ss.get('_bt_csv'):
+        st.download_button('💾 下載回測原始紀錄（.csv.gz，之後可直接載入，不用重抓）', ss['_bt_csv'],
+                           file_name=f'回測原始紀錄{("_" + ss["bt_seg_label"]) if ss.get("bt_seg_label") else ""}_{dt.date.today()}.csv.gz', key='dl_btcsv')
+    elif st.button('💾 產生回測原始紀錄檔（之後可直接載入，不用重抓）', key='mk_btcsv'):
+        with st.spinner('壓縮中…'):
+            ss['_bt_csv'] = bt_csv_gz(df)
+            ss['_bt_csv_sig'] = id(ss.get('bt_df'))
+        st.rerun()
 
     def show(title, t, note=None):
         st.markdown(f'##### {title}')
@@ -3304,12 +3519,15 @@ def render_backtest(st, ss, K):
         t = tag_hitrate(df, fld, lbl)
         if len(t):
             show(title + '標記 vs 實際報酬', t)
-    show('📐 15種型態各自「剛形成」vs 實際報酬', pattern_hits(df), '依樣本數排序，樣本數<10筆的不列出。')
+    show('📐 15種型態各自「剛形成」vs 實際報酬', bt_memo(ss, 'pat', (), lambda: pattern_hits(df)), '依樣本數排序，樣本數<10筆的不列出。')
+    show('🆕 新增技術面條件 vs 實際報酬（52週高點／均線多頭排列／布林收窄／向上跳空）',
+         bt_memo(ss, 'newtech', (), lambda: new_tech_table(df)),
+         '52週高點需要約一年的歷史，回測會自動多抓資料；資料不足的評估點不列入「是／否」。')
 
     st.markdown('##### 🎛️ 參數網格搜尋（單一評分公式的權重調整）')
     gh = st.selectbox('優化目標天數', HORIZONS, index=1, key='gh', format_func=lambda h: f'{h}日')
     st.caption('⚠️ 在已收集的歷史資料上找「表現較好」的參數組合，樣本有限時容易過度適配，僅供方向參考。')
-    st.dataframe(grid_search(df, gh), hide_index=True, use_container_width=True)
+    st.dataframe(bt_memo(ss, 'grid', (gh,), lambda: grid_search(df, gh)), hide_index=True, use_container_width=True)
 
     # ── 多因子複選搜尋 ──
     st.markdown('##### 🧩 多因子複選搜尋（找出哪幾項欄位組合起來勝率最高）')
@@ -3322,16 +3540,24 @@ def render_backtest(st, ss, K):
     cmt = c5.number_input('t值門檻', -10.0, 20.0, 1.0, 0.5, key='cmt',
                           help='排除 t值(同日調整) 低於門檻的組合（t<1：扣掉同一天大盤後幾乎沒有超額報酬，勝率多半只是跟著大盤）')
     cred = c6.checkbox('排除冗餘組合', True, key='cred', help='多加一個條件後樣本完全沒變（例如「母子懷抱剛形成」必然也是「型態剛形成」），這種組合不重複列出')
-    res, tested, base = combo_search(df, ch, 3, int(cms), float(cwr), cred, 't' if csort.startswith('t') else 'win')
+    with st.spinner('多因子複選搜尋計算中…'):
+        res, tested, base = bt_memo(ss, 'combo', (ch, int(cms), float(cwr), cred, csort),
+                                    lambda: combo_search(df, ch, 3, int(cms), float(cwr), cred, 't' if csort.startswith('t') else 'win'))
     n_before_t = len(res)
     if len(res) and 't值(同日調整)' in res.columns:
         res = res[res['t值(同日調整)'] >= float(cmt)].reset_index(drop=True)
+    cboth = st.checkbox('只列各段 t值都 ≥ 2 的組合（✅ 各段一致）', False, key='cboth',
+                        help='回測期間依評估日切段（資料超過18個月切三段，否則前後兩半），各段各自算同日調整 t 值。'
+                             '每段都 ≥2 代表不是單一段行情造成的巧合，最值得相信')
+    if cboth and len(res) and '各段一致' in res.columns:
+        res = res[res['各段一致'] == '✅'].reset_index(drop=True)
     if len(res):
         res.insert(1, '類型', res['條件組合'].map(lambda s: combo_type_label([x.strip() for x in s.split('＋')])))
     if base:
         st.caption(f"全體基準（{ch}日）：樣本 {base['n']:,}　平均報酬 {base['avg']:.2f}%　勝率 {base['win']:.1f}%　中位數 {base['median']:.2f}%　"
-                   f"｜共測試 {tested:,} 種組合，勝率≥{cwr:.0f}% 的 {n_before_t:,} 組，再排除 t值<{cmt:g} 後剩 {len(res):,} 組。"
-                   '⚠️ 測試組合越多，純運氣突出的也越多。「同日超額報酬」＝每筆報酬扣掉同一天全部紀錄的平均，t值也用它算，已排除大盤齊漲齊跌；t>2 較可信。')
+                   f"｜共測試 {tested:,} 種組合，勝率≥{cwr:.0f}% 的 {n_before_t:,} 組，再排除 t值<{cmt:g} 後剩 {len(res):,} 組"
+                   + (f"｜{base['parts']}（✅＝每段 t 都 ≥2，⚠️k/n＝n段中有k段達標）。" if base.get('parts') else '。')
+                   + '⚠️ 測試組合越多，純運氣突出的也越多。「同日超額報酬」＝每筆報酬扣掉同一天全部紀錄的平均，t值也用它算，已排除大盤齊漲齊跌；t>2 較可信。')
     st.dataframe(res, hide_index=True, use_container_width=True, height=420)
     if len(res):
         st.download_button('📥 匯出 Excel', df_to_excel_bytes(res, '多因子複選搜尋'),
@@ -3346,11 +3572,14 @@ def render_backtest(st, ss, K):
     mpct = d3.number_input('飆股比例門檻(%)', 0.0, 100.0, 10.0, 1.0, key='mpct')
     mms = d4.number_input('最少樣本數', 5, 5000, 20, 5, key='mms')
     mred = d5.checkbox('排除冗餘組合', True, key='mred')
-    mres, mtested, mbase = moonshot_search(df, mh, float(mthr), 3, int(mms), float(mpct), mred)
+    with st.spinner('飆股搜尋計算中…'):
+        mres, mtested, mbase = bt_memo(ss, 'moon', (mh, float(mthr), int(mms), float(mpct), mred),
+                                       lambda: moonshot_search(df, mh, float(mthr), 3, int(mms), float(mpct), mred))
     if mbase:
         st.caption(f"全體基準（{mh}日漲幅>{mthr:.0f}%）：{mbase['n']:,} 筆中 {mbase['moonN']:,} 次飆股，"
-                   f"基準飆股比例 {mbase['pct']:.2f}%　｜共測試 {mtested:,} 種組合，達標 {len(mres):,} 組。"
-                   '「倍數」＝組合飆股比例÷基準；飆股是稀有事件，飆股次數只有個位數的不建議當真。')
+                   f"基準飆股比例 {mbase['pct']:.2f}%　｜共測試 {mtested:,} 種組合，達標 {len(mres):,} 組"
+                   + (f"｜{mbase['parts']}，每段飆股比例都高才可信。" if mbase.get('parts') else '。')
+                   + '「倍數」＝組合飆股比例÷基準；飆股是稀有事件，飆股次數只有個位數的不建議當真。')
     st.dataframe(mres, hide_index=True, use_container_width=True, height=420)
     if len(mres):
         st.download_button('📥 匯出 Excel', df_to_excel_bytes(mres, '飆股搜尋'),
