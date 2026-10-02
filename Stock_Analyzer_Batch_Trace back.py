@@ -2231,6 +2231,19 @@ def score_label(t):
     return '積極做多' if t >= 80 else '可考慮進場' if t >= 65 else '觀望' if t >= 50 else '不建議進場'
 
 
+# ── 組合型態：依命中類別（S/#/M/W/F）的組合分級，依據三年回測（20日報酬，含 t(依日) 檢驗，2026-10-02 統計） ──
+COMBO_STYLE_RULES = {'S#MWF': '進攻', 'SF': '進攻', 'SMF': '進攻', 'SWF': '進攻', '#MWF': '進攻', 'S#W': '穩健', '#WF': '穩健', '#MW': '穩健', 'M': '彩券', 'F': '彩券', 'MF': '彩券', '#M': '彩券', '#F': '彩券', '#MF': '彩券'}
+COMBO_STYLE_ICON = {'進攻': '🚀進攻', '穩健': '🛡️穩健', '彩券': '🎲彩券'}
+COMBO_STYLE_NOTE = {'進攻': '台股回測：20日超額+2.1~8.8%、飆股率8~18%，t(依日)2.5~5.7、前後半段都正；S#MWF最強（勝率62%、超額+8.8%、飆股率18%）',
+                    '穩健': '台股回測：20日勝率61~70%、跌>10%僅6~9%（全體13%）；穩在低回檔，超額不顯著（t(依日)≈1）',
+                    '彩券': '台股回測：20日勝率42~49%、跌>10%約16~23%，但少數大漲拉高平均，MF/#MF/F 期望值為正（t(依日)≈3.5）；小部位分散＋停損'}
+
+
+def combo_style(ms, mp, mm, mw, mf):
+    key = ''.join(k for k, x in (('S', ms), ('#', mp), ('M', mm), ('W', mw), ('F', mf)) if x)
+    return COMBO_STYLE_ICON.get(COMBO_STYLE_RULES.get(key, ''), '')
+
+
 def summary_frame(results, extras_flags, K, live=None):
     recs = []
     for r in results:
@@ -2318,6 +2331,7 @@ def summary_frame(results, extras_flags, K, live=None):
         rec['命中數'] = len(ms) + len(mp) + len(mm)
         # 命中類別數：S/#/M/W/F 五類中命中幾類（同類多個組合常共用同一訊號，類別數比總命中數更能反映訊號強弱）
         rec['命中類別數'] = sum(1 for x in (ms, mp, mm, mw, mf) if x)
+        rec['組合型態'] = combo_style(ms, mp, mm, mw, mf)
         rec['_pbPass'] = pb['allPass']
         rec['_pt'] = 'justbreak' if pt['anyJustBroke'] else ('breakout' if pt['anyBreakout'] else ('forming' if pt['anyFormed'] else 'none'))
         recs.append(rec)
@@ -2326,7 +2340,7 @@ def summary_frame(results, extras_flags, K, live=None):
         return df
     # 欄位順序：股票、名稱之後依序放 股價、漲跌幅%、選股型命中、指定組合命中、型態確認；不顯示 評等、命中數、+DI/-DI/ADX/ADXR
     df = df.rename(columns={'收盤': '股價'}).drop(columns=['評等', '命中數', '+DI', '-DI', 'ADX', 'ADXR'], errors='ignore')
-    front = ['股票', '名稱', '股價', '漲跌幅%', '命中類別數', '選股型命中', '指定組合命中', '回測高勝率命中', '回測飆股命中', '型態確認']
+    front = ['股票', '名稱', '股價', '漲跌幅%', '命中類別數', '組合型態', '選股型命中', '指定組合命中', '回測高勝率命中', '回測飆股命中', '型態確認']
     return df[[c for c in front if c in df.columns] + [c for c in df.columns if c not in front]]
 
 
@@ -2783,6 +2797,8 @@ def hit_records(results, K, live=None):
             continue
         b = r['bars']
         e = b.n - 1
+        if not b.close[e] or b.close[e] <= 0:   # 0價（無成交／暫停交易）不列入命中
+            continue
         pc = b.close[e - 1] if e >= 1 else b.close[e]
         lines, codes, wins, moons, ts = [], [], [], [], []
 
@@ -2822,7 +2838,9 @@ def hits_excel_bytes(recs, sheet='命中組合股票'):
 def load_hit_log():
     try:
         df = pd.read_csv(HIT_LOG_FILE, dtype={'股票代號': str, '日期': str})
-        return df
+        # 股價≤0 的紀錄是資料源當天回傳0價（無成交／暫停交易）造成的假命中，直接排除
+        px_ = pd.to_numeric(df['股價'], errors='coerce')
+        return df[~(px_ <= 0)].reset_index(drop=True)
     except Exception:  # noqa
         return pd.DataFrame(columns=HIT_COLS)
 
@@ -3268,7 +3286,8 @@ def render_batch(st, ss, K):
         st.dataframe(t2, hide_index=True, use_container_width=True, height=240)
         st.caption(f"🔵 W＝回測高勝率（{len(K.get('BT_WIN_COMBOS', []))}組，青色）：三年回測任一天期勝率>60% 且 t>2；標 ⏱ 的是擇時型。"
                    f"　🔴 F＝回測飆股（{len(K.get('BT_HOT_COMBOS', []))}組，粉紅色）：10/20日飆股比例>10% 且飆股次數≥10。摘要表每類只顯示最強的{BT_HIT_SHOW}個，其餘以 +N 表示。"
-                   "　🔢 命中類別數＝S/#/M/W/F 五類中命中幾類；同類組合常共用同一訊號，類別數比總命中數更能反映強度（回測：≥3類 台股20日超額約+2~4%、美股+0.6~1.8%，但波動也較大）。")
+                   "　🔢 命中類別數＝S/#/M/W/F 五類中命中幾類；同類組合常共用同一訊號，類別數比總命中數更能反映強度（回測：≥3類 台股20日超額約+2~4%、美股+0.6~1.8%，但波動也較大）。"
+                   "　🏷️ 組合型態（依命中類別組合分級）：" + '　'.join(f"{COMBO_STYLE_ICON[k]}＝{'、'.join(c for c, v in COMBO_STYLE_RULES.items() if v == k)}（{COMBO_STYLE_NOTE[k]}）" for k in ('進攻', '穩健', '彩券')) + "；其他組合不標示。")
         tw_ = pd.DataFrame([{'編號': f'W{i + 1}', '類型': combo_type_label(c), '條件組合': '＋'.join(c),
                              '三年回測': '　'.join(f"{h}日 勝率{e['win']}% t={e['t']}" for h, e in sorted(K['BT_WIN_STATS'].get(' ＋ '.join(c), {}).items(), key=lambda kv: int(kv[0])))}
                             for i, c in enumerate(K.get('BT_WIN_COMBOS', []))])
@@ -3313,6 +3332,11 @@ def render_batch(st, ss, K):
         for c, colr in hit_colors.items():
             if c in view.columns:
                 sty = sty.set_properties(subset=[c], **{'color': colr, 'font-weight': '600'})
+        if '組合型態' in view.columns:
+            _sc = {'進攻': 'color:#d84315;font-weight:700', '穩健': 'color:#2e7d32;font-weight:700', '彩券': 'color:#8e24aa;font-weight:700'}
+            def _style_css(v):
+                return next((c for k, c in _sc.items() if k in str(v)), '')
+            sty = sty.map(_style_css, subset=['組合型態']) if hasattr(sty, 'map') else sty.applymap(_style_css, subset=['組合型態'])
         show_obj = sty
     except Exception:  # noqa  沒有 jinja2 等套件時退回不上色
         show_obj = view
