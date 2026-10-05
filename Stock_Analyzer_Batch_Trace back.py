@@ -29,6 +29,7 @@
 #  每日自動追蹤命中組合（排程用，不開介面）：
 #      python stock_analyzer_poc.py daily --list top100 --token 你的FinMindToken
 # ════════════════════════════════════════════════════════════════════
+import gc
 import math
 import re
 import json
@@ -70,7 +71,7 @@ class Bars:
     __slots__ = ('date', 'open', 'high', 'low', 'close', 'volume', 'n',
                  'ma5', 'ma10', 'ma20', 'ma60', 'macd', 'macdSig', 'macdHist', 'rsi',
                  'bbU', 'bbL', 'vm5', 'vm20', 'kdK', 'kdD', 'kdjK', 'kdjD', 'kdjJ',
-                 'plusDI', 'minusDI', 'adx', 'adxr', '_zz', '_good', '_filtered', '_fmap')
+                 'plusDI', 'minusDI', 'adx', 'adxr', '_zz', '_good', '_filtered', '_fmap', '_ma100')
 
     def __init__(self, rows):
         # rows: list of dict(date, open, high, low, close, volume)，已依日期排序
@@ -85,6 +86,7 @@ class Bars:
         self._good = None
         self._filtered = None
         self._fmap = None
+        self._ma100 = None
         self._enrich()
 
     # ── 指標（逐一照 HTML 版的 JS 算法，連浮點運算順序都一致）──
@@ -1080,8 +1082,11 @@ LONG_HISTORY_DAYS = 400   # 52週高點需要約250根K棒；批次分析會多�
 
 
 def tech_extras(b, e):
-    """52週高點距離／創新高、均線多頭排列、布林寬度在近半年的百分位、近3日向上跳空。資料不足時為 None"""
-    out = dict(high52Dist=None, newHigh52=None, maBull=None, bbwRank=None, gapUp3=None)
+    """52週高點距離／創新高、均線多頭排列、布林寬度在近半年的百分位、近3日向上跳空、
+    3日內突破季線／半年線、連續放量、MACD零軸下金叉。資料不足時為 None"""
+    out = dict(high52Dist=None, newHigh52=None, maBull=None, bbwRank=None, gapUp3=None,
+               crossMa60_3=None, crossMa100_3=None, vol3Ratio=None, gcBelow0_3=None,
+               udVolRatio20=None, cmf20=None, obvNewHigh60=None)
     if e < 0 or e >= b.n:
         return out
     if e >= 249:
@@ -1105,6 +1110,46 @@ def tech_extras(b, e):
             out['bbwRank'] = sum(1 for w in ws if w <= cur) / len(ws) * 100
     if e >= 3:
         out['gapUp3'] = int(any(b.low[e - k] > b.high[e - k - 1] for k in range(3)))
+    # 3日內收盤由下往上突破季線(MA60)／半年線(MA100)，且今天仍站在線上（2026-10-03 參考 BBW+MACD 掃描器新增）
+    if b._ma100 is None:
+        b._ma100 = b._ma(b.close, 100)
+    for fld, ma in (('crossMa60_3', b.ma60), ('crossMa100_3', b._ma100)):
+        if e >= 3 and None not in (ma[e - 3], ma[e]):
+            out[fld] = int(b.close[e] >= ma[e] and any(
+                b.close[j - 1] < ma[j - 1] and b.close[j] >= ma[j] for j in range(e - 2, e + 1)))
+    # 連續放量：近3日均量 ÷ 再往前20日均量
+    if e >= 22:
+        base = sum(b.volume[e - 22:e - 2]) / 20
+        out['vol3Ratio'] = (sum(b.volume[e - 2:e + 1]) / 3) / base if base > 0 else None
+    # MACD 零軸下（DIF<0）3日內黃金交叉＝低檔轉折
+    if e >= 3:
+        out['gcBelow0_3'] = int(any(b.macd[j - 1] <= b.macdSig[j - 1] and b.macd[j] > b.macdSig[j] and b.macd[j] < 0
+                                    for j in range(e - 2, e + 1)))
+    # 2026-10-04 買賣力道近似（日線沒有內外盤，用收盤在當日區間的位置／漲跌日量推估）
+    out.update(dict(udVolRatio20=None, cmf20=None, obvNewHigh60=None))
+    if e >= 20:
+        up = dn = 0.0
+        mfv = vs = 0.0
+        for j in range(e - 19, e + 1):
+            v = b.volume[j]
+            if b.close[j] > b.close[j - 1]:
+                up += v
+            elif b.close[j] < b.close[j - 1]:
+                dn += v
+            rng = b.high[j] - b.low[j]
+            if rng > 0:
+                mfv += ((b.close[j] - b.low[j]) - (b.high[j] - b.close[j])) / rng * v
+            vs += v
+        out['udVolRatio20'] = min(up / dn, 99.0) if dn > 0 else (99.0 if up > 0 else None)
+        out['cmf20'] = mfv / vs if vs > 0 else None
+    if e >= 61:
+        # OBV 從 e-60 起算（起點＝0），今天的 OBV 高於前60天每一天＝OBV創60日新高
+        obv, mx = 0.0, 0.0
+        for j in range(e - 59, e):
+            obv += b.volume[j] if b.close[j] > b.close[j - 1] else (-b.volume[j] if b.close[j] < b.close[j - 1] else 0.0)
+            mx = max(mx, obv)
+        obv += b.volume[e] if b.close[e] > b.close[e - 1] else (-b.volume[e] if b.close[e] < b.close[e - 1] else 0.0)
+        out['obvNewHigh60'] = int(obv > mx)
     return out
 
 
@@ -1150,6 +1195,9 @@ def build_flag_row(b: Bars, e, bm, pc: PatternCache, vp_params=None, extras=None
     row['divTotal'] = ex.get('divTotal')
     row['priceYoy3m'] = ex.get('priceYoy3m')
     row['inst3m'] = ex.get('inst3m')
+    row['trust5'] = ex.get('trust5')
+    row['foreign5'] = ex.get('foreign5')
+    row['trustStreak3'] = ex.get('trustStreak3')
     row['confluenceCount'] = confluence_count(row)
     row.update((extras or {}).get('tech') or tech_extras(b, e))
     info = dict(dm=dm, sig=sig, pb=pb, pt=pt, prof=prof, vps=vps, rs=rs, vr=vr)
@@ -1187,6 +1235,13 @@ NEW_TECH_FLAGS = [
     ('maBull', '均線多頭排列(5>20>60且站上月線)', lambda s: s.eq(1)),
     # 布林通道收窄：2026-09-30 台股三年回測報酬低於基準，已移除（bbwRank 欄位仍保留）
     ('gapUp3', '近3日向上跳空缺口', lambda s: s.eq(1)),
+    # 2026-10-03 參考 BBW+MACD 掃描器新增；2026-10-04 三年三段回測：突破季線／半年線、MACD零軸下金叉無效或反向，
+    # 已移除旗標（crossMa60_3／crossMa100_3／gcBelow0_3 欄位仍保留在回測紀錄裡）
+    ('vol3Ratio', '連續放量(近3日均量≥1.5倍前20日均量)', lambda s: s.ge(1.5)),
+    # 2026-10-04 買賣力道近似（待回測驗證）
+    ('udVolRatio20', '漲時量≥跌時量1.5倍(近20日)', lambda s: s.ge(1.5)),
+    ('cmf20', 'CMF資金流買方佔優(近20日≥0.1)', lambda s: s.ge(0.1)),
+    ('obvNewHigh60', 'OBV能量潮創60日新高', lambda s: s.eq(1)),
 ]
 # 不放進「多因子複選搜尋／飆股搜尋」的條件（回測貢獻極低或與個別型態重複；指定組合比對與統計仍可使用）
 SEARCH_EXCLUDE_FLAGS = {'型態成形中', '型態突破確認', '型態剛形成(剛突破)', '突破上升軌道線剛形成',
@@ -1293,6 +1348,18 @@ def build_condition_flags(df: pd.DataFrame):
     if has('inst3m'):
         F['三大法人近3月買超'] = df['inst3m'].gt(0)
         F['三大法人近3月賣超'] = df['inst3m'].lt(0)
+    if has('trust5'):
+        F['投信近5日買超'] = df['trust5'].gt(0)
+    if has('trustStreak3'):
+        F['投信連續買超≥3日'] = eq1('trustStreak3')
+    if has('foreign5'):
+        F['外資近5日買超'] = df['foreign5'].gt(0)
+        if has('trust5'):
+            F['土洋同買(外資、投信近5日皆買超)'] = df['foreign5'].gt(0) & df['trust5'].gt(0)
+    if has('adx') and has('adxr') and has('plusDI'):
+        # 2026-10-03 台股三年回測：飆股率6.0%（基準3.6%）、t(依日)6.1，但勝率略低於基準
+        F['DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR)'] = (_col(df, 'plusDI').gt(_col(df, 'minusDI')) & _col(df, 'adx').ge(25)
+                                              & _col(df, 'adx').gt(_col(df, 'adxr')))
     if any(has(f) for f in PH_FIELDS):
         for pid, name in PATTERN_DEFS:
             F[name + '剛形成'] = eq1('ph_' + pid)
@@ -1692,21 +1759,35 @@ FINMIND_URLS = ['https://api.finmindtrade.com/api/v4/data', 'https://api.finmind
 _http = requests.Session()
 
 
+class FinMindQuotaError(RuntimeError):
+    """FinMind 每小時請求額度用完（HTTP 402／Requests reach the upper limit）"""
+
+
 def api_get(params, token, timeout=30):
-    last = ''
+    """先打主站，失敗再試備援站；兩邊的錯誤都會列出來（以前只回報最後一個，主站的真正原因會被蓋掉）。
+    額度用完時直接丟 FinMindQuotaError，不再去打備援站。"""
+    errs = []
     for url in FINMIND_URLS:
+        host = url.split('/')[2]
         try:
             r = _http.get(url, params={**params, 'token': token}, timeout=timeout)
-            if r.status_code != 200:
-                last = f'HTTP {r.status_code}'
-                continue
-            j = r.json()
-            if j.get('status') == 200:
-                return j
-            last = j.get('msg') or f"status={j.get('status')}"
         except Exception as ex:  # noqa
-            last = str(ex)
-    raise RuntimeError(last or 'fetch failed')
+            errs.append(f'{host} 連線失敗（{type(ex).__name__}）')
+            continue
+        try:
+            j = r.json()
+        except Exception:  # noqa
+            j = {}
+        msg = str(j.get('msg') or '') if isinstance(j, dict) else ''
+        if r.status_code == 402 or j.get('status') == 402 or 'upper limit' in msg.lower():
+            raise FinMindQuotaError(f'FinMind 請求額度已用完（{msg or "HTTP 402"}）')
+        if r.status_code != 200:
+            errs.append(f'{host} HTTP {r.status_code}' + (f'：{msg}' if msg else ''))
+            continue
+        if j.get('status') == 200:
+            return j
+        errs.append(f'{host}：{msg or "status=" + str(j.get("status"))}')
+    raise RuntimeError('；'.join(errs) or 'fetch failed')
 
 
 def _ds(d):
@@ -1794,7 +1875,7 @@ def fetch_revenue_3m(sid, token):
     return out
 
 
-def fetch_inst_monthly(sid, token):
+def fetch_inst_monthly(sid, token, with_flow=False):
     end = dt.date.today()
     start = end - dt.timedelta(days=100)
     j = api_get(dict(dataset='TaiwanStockInstitutionalInvestorsBuySell', data_id=sid,
@@ -1811,7 +1892,24 @@ def fetch_inst_monthly(sid, token):
     ks = sorted(mm)[-3:]
     if not ks:
         raise RuntimeError('解析不出日期/買賣超欄位')
-    return [dict(year=int(k[:4]), month=int(k[5:7]), net=mm[k]) for k in ks]
+    out = [dict(year=int(k[:4]), month=int(k[5:7]), net=mm[k]) for k in ks]
+    if with_flow:
+        # 投信／外資近5日、投信連3日買超：跟回測同一套算法（inst_flow_asof）
+        daily, trust, foreign = {}, {}, {}
+        for r in rows:
+            d = str(r.get('date', ''))[:10]
+            if len(d) < 10:
+                continue
+            net = float(r.get('buy') or 0) - float(r.get('sell') or 0)
+            daily[d] = daily.get(d, 0) + net
+            if _is_trust(r):
+                trust[d] = trust.get(d, 0) + net
+            elif _is_foreign(r):
+                foreign[d] = foreign.get(d, 0) + net
+        dates = sorted(daily)
+        flow = inst_flow_asof(daily, trust, foreign, dates, len(dates) - 1) if dates else {}
+        return out, flow
+    return out
 
 
 def last_n_calendar_months(n):
@@ -1949,13 +2047,40 @@ def fetch_inst_hist(sid, token, days_back):
     end = dt.date.today()
     j = api_get(dict(dataset='TaiwanStockInstitutionalInvestorsBuySell', data_id=sid,
                      start_date=_ds(end - dt.timedelta(days=days_back)), end_date=_ds(end)), token)
-    daily = {}
+    daily, trust, foreign = {}, {}, {}
     for r in j.get('data') or []:
         d = str(r.get('date', ''))[:10]
         if len(d) < 10:
             continue
-        daily[d] = daily.get(d, 0) + (float(r.get('buy') or 0) - float(r.get('sell') or 0))
-    return daily
+        net = float(r.get('buy') or 0) - float(r.get('sell') or 0)
+        daily[d] = daily.get(d, 0) + net
+        if _is_trust(r):
+            trust[d] = trust.get(d, 0) + net
+        elif _is_foreign(r):
+            foreign[d] = foreign.get(d, 0) + net
+    return daily, trust, foreign
+
+
+def _is_trust(r):
+    nm = str(r.get('name') or '')
+    return 'Investment_Trust' in nm or '投信' in nm
+
+
+def _is_foreign(r):
+    """外資＝外資及陸資（Foreign_Investor）＋外資自營商（Foreign_Dealer_Self）"""
+    nm = str(r.get('name') or '')
+    return 'Foreign' in nm or '外資' in nm
+
+
+def inst_flow_asof(daily, trust, foreign, dates, e):
+    """截至第 e 根K棒（含）：投信／外資近5個交易日買賣超合計、投信是否連續3日買超。
+    這5天都沒有法人資料時全部回傳 None"""
+    ds = dates[max(0, e - 4):e + 1]
+    if not any(d in daily for d in ds):
+        return dict(trust5=None, foreign5=None, trustStreak3=None)
+    d3 = dates[max(0, e - 2):e + 1]
+    return dict(trust5=sum(trust.get(d, 0) for d in ds), foreign5=sum(foreign.get(d, 0) for d in ds),
+                trustStreak3=int(len(d3) == 3 and all(trust.get(d, 0) > 0 for d in d3)))
 
 
 def revenue_known_by(y, m, asof):
@@ -2060,11 +2185,18 @@ def store_bt_df(df):
     return df
 
 
+def release_bt_state(ss):
+    """清掉上一份回測資料與衍生的快取／壓縮檔，釋放記憶體"""
+    for k in ('bt_df', '_bt_memo', '_bt_csv', '_bt_csv_sig', 'live_stats', 'live_stats_sig'):
+        ss.pop(k, None)
+    gc.collect()
+
+
 def bt_memo(ss, name, params, fn):
     """回測分析結果快取（存在 session）：同一份回測資料、同樣參數只算一次，
     改任何一個選單時 Streamlit 會整頁重跑，沒有快取的話每次都要重算幾十秒。"""
     df = ss.get('bt_df')
-    sig = (id(df), len(df) if df is not None else 0)
+    sig = (ss.get('bt_ver'), id(df), len(df) if df is not None else 0)
     memo = ss.get('_bt_memo')
     if memo is None or memo.get('_sig') != sig:
         memo = {'_sig': sig}
@@ -2106,87 +2238,148 @@ def load_bt_files(files):
 BT_SEG_OPTIONS = ['自訂月數', '三年分三段・第1段（最近1年）', '三年分三段・第2段（1～2年前）', '三年分三段・第3段（2～3年前）']
 
 def run_backtest(token, universe, months_back, include_div, include_inst, min_liq, vp_params,
-                 delay=0.3, on_progress=None, should_stop=None, end_offset_months=0):
-    name_map = fetch_name_map(token)
+                 delay=0.3, on_progress=None, should_stop=None, end_offset_months=0, max_quota_wait=65 * 60):
+    """FinMind 每小時額度用完時（HTTP 402）不會把剩下的股票全部記成失敗，而是暫停等待、額度恢復後從同一檔繼續；
+    最多等 max_quota_wait 秒。前 40 檔全部因同一個原因失敗（Token 錯誤、連線不到）會提早停止。"""
     off = int(end_offset_months or 0)   # 分段回測：評估區間往前推 off 個月（例：第2段＝1～2年前）
     buf = 60
     maxh = max(HORIZONS)
     price_days = (months_back + off) * 30 + buf + maxh + 10 + 400   # +400天：52週高點、布林收窄需要約一年歷史（營收乖離也夠用）
-    try:
-        bm = fetch_benchmark(token, price_days)
-    except Exception:  # noqa
-        bm = None
     rev_days = (months_back + off) * 30 + 400
     inst_days = (months_back + off) * 30 + 100
     win_start = _ds(dt.date.today() - dt.timedelta(days=(months_back + off) * 30))
     win_end = _ds(dt.date.today() - dt.timedelta(days=off * 30)) if off else None
-    records = []
+    fail_reasons = {}
+    frames = []   # 每檔算完就轉成 float32 DataFrame（整段回測若用 list of dict 暫存，十幾萬筆會吃掉近 1GB 記憶體）
     saved = failed = 0
     total = len(universe)
+    stopped = None
+    state = {'waited': 0.0}
+
+    def prog(i, sid, note=None):
+        if on_progress:
+            try:
+                on_progress(i, total, saved, failed, sid, note)
+            except TypeError:   # 舊版 callback 沒有 note 參數
+                on_progress(i, total, saved, failed, sid)
+
+    def with_quota_wait(fn, i, sid):
+        """執行 fn；碰到額度用完就每 30 秒重試一次，累計最多等 max_quota_wait 秒"""
+        while True:
+            try:
+                return fn()
+            except FinMindQuotaError as qe:
+                if state['waited'] >= max_quota_wait:
+                    raise
+                mins = int(state['waited'] // 60)
+                prog(i, sid, f'⏸ {qe}，暫停等待額度恢復（已等 {mins} 分鐘，最多 {max_quota_wait // 60} 分鐘），恢復後會自動從 {sid or "開頭"} 繼續')
+                for _ in range(6):
+                    if should_stop and should_stop():
+                        raise
+                    time.sleep(5)
+                state['waited'] += 30
+
+    try:
+        name_map = with_quota_wait(lambda: fetch_name_map(token), 0, None)
+        bm = with_quota_wait(lambda: fetch_benchmark(token, price_days), 0, None)
+    except FinMindQuotaError as qe:
+        return pd.DataFrame(), dict(saved=0, failed=0, total=total, top_fail=[str(qe)],
+                                    stopped=f'{qe}，等了 {max_quota_wait // 60} 分鐘仍未恢復')
+    except Exception:  # noqa
+        name_map = name_map if 'name_map' in locals() else {}
+        bm = None
+
+    def one(sid):
+        rows = fetch_price(sid, token, price_days)
+        b = Bars(rows)
+        n = b.n
+        ev_end = n - maxh
+        if ev_end <= buf:
+            return None, '股價資料天數不足'
+        rev, pxm, inst, trust, foreign = {}, {}, {}, {}, {}
+        if include_div:
+            try:
+                rev = fetch_revenue_hist(sid, token, rev_days)
+                pxm = price_month_avg_map(b)
+            except FinMindQuotaError:
+                raise
+            except Exception:  # noqa
+                rev = {}
+        if include_inst:
+            try:
+                inst, trust, foreign = fetch_inst_hist(sid, token, inst_days)
+            except FinMindQuotaError:
+                raise
+            except Exception:  # noqa
+                inst, trust, foreign = {}, {}, {}
+        pc = PatternCache(b)
+        recs = []
+        for e in range(buf, ev_end):
+            ds = b.date[e]
+            if ds < win_start or (win_end and ds >= win_end):
+                continue
+            if min_liq > 0:
+                s0 = max(0, e - 19)
+                liq = sum(b.close[k] * b.volume[k] for k in range(s0, e + 1)) / (e + 1 - s0)
+                if liq < min_liq:
+                    continue
+            ex = {}
+            if include_div:
+                ex['divTotal'], ex['priceYoy3m'] = divergence_asof(rev, pxm, ds)
+            if include_inst:
+                ex['inst3m'] = inst3m_asof(inst, ds)
+                ex.update(inst_flow_asof(inst, trust, foreign, b.date, e))
+            row, _ = build_flag_row(b, e, bm, pc, vp_params, ex)
+            ec = b.close[e]
+            row['entryClose'] = ec
+            for h in HORIZONS:
+                row[f'ret{h}d'] = (b.close[e + h] - ec) / ec * 100 if (e + h < n and ec) else None
+            recs.append(row)
+        if not recs:
+            return None, None   # 沒有落在評估區間／流動性門檻內，不算失敗
+        d = pd.DataFrame(recs)
+        del recs
+        for c in d.columns:
+            if c != 'evalDate':
+                d[c] = pd.to_numeric(d[c], errors='coerce').astype('float32')
+        d.insert(1, 'stockId', sid)
+        d.insert(2, 'name', name_map.get(sid, sid))
+        return d, None
+
     for i, sid in enumerate(universe):
         if should_stop and should_stop():
             break
-        if on_progress:
-            on_progress(i, total, saved, failed, sid)
+        prog(i, sid)
         try:
-            rows = fetch_price(sid, token, price_days)
-            b = Bars(rows)
-            n = b.n
-            ev_end = n - maxh
-            if ev_end <= buf:
-                failed += 1
-                continue
-            rev, pxm, inst = {}, {}, {}
-            if include_div:
-                try:
-                    rev = fetch_revenue_hist(sid, token, rev_days)
-                    pxm = price_month_avg_map(b)
-                except Exception:  # noqa
-                    rev = {}
-            if include_inst:
-                try:
-                    inst = fetch_inst_hist(sid, token, inst_days)
-                except Exception:  # noqa
-                    inst = {}
-            pc = PatternCache(b)
-            nm = name_map.get(sid, sid)
-            for e in range(buf, ev_end):
-                ds = b.date[e]
-                if ds < win_start or (win_end and ds >= win_end):
-                    continue
-                if min_liq > 0:
-                    s0 = max(0, e - 19)
-                    liq = sum(b.close[k] * b.volume[k] for k in range(s0, e + 1)) / (e + 1 - s0)
-                    if liq < min_liq:
-                        continue
-                ex = {}
-                if include_div:
-                    ex['divTotal'], ex['priceYoy3m'] = divergence_asof(rev, pxm, ds)
-                if include_inst:
-                    ex['inst3m'] = inst3m_asof(inst, ds)
-                row, _ = build_flag_row(b, e, bm, pc, vp_params, ex)
-                row['stockId'] = sid
-                row['name'] = nm
-                ec = b.close[e]
-                row['entryClose'] = ec
-                for h in HORIZONS:
-                    row[f'ret{h}d'] = (b.close[e + h] - ec) / ec * 100 if (e + h < n and ec) else None
-                records.append(row)
-                saved += 1
-        except Exception:  # noqa
+            d, reason = with_quota_wait(lambda: one(sid), i, sid)
+        except FinMindQuotaError as qe:
+            stopped = f'{qe}，等了 {max_quota_wait // 60} 分鐘仍未恢復，停在第 {i + 1} 檔（{sid}）。已完成的部分仍可下載，但這一段不完整，建議額度恢復後整段重跑'
+            break
+        except Exception as ex:  # noqa
+            d, reason = None, (str(ex)[:120] or type(ex).__name__)
+        if d is not None:
+            frames.append(d)
+            saved += len(d)
+        elif reason:
             failed += 1
+            fail_reasons[reason] = fail_reasons.get(reason, 0) + 1
+        if i + 1 >= 40 and saved == 0 and failed >= i + 1 and len(fail_reasons) == 1:
+            stopped = f'前 {i + 1} 檔全部失敗且原因相同，提早停止：{next(iter(fail_reasons))}'
+            break
         if i < total - 1 and delay:
             time.sleep(delay)
-    if on_progress:
-        on_progress(total, total, saved, failed, None)
-    df = pd.DataFrame(records)
+    prog(total, None)
+    df = pd.concat(frames, ignore_index=True, sort=False) if frames else pd.DataFrame()
+    del frames
     if len(df):
         front = ['evalDate', 'stockId', 'name']
         df = df[front + [c for c in df.columns if c not in front]]
         for c in df.columns:
-            if c not in ('evalDate', 'stockId', 'name'):
-                df[c] = pd.to_numeric(df[c], errors='coerce')
-    return df, dict(saved=saved, failed=failed, total=total)
+            if c not in ('evalDate', 'stockId', 'name') and df[c].dtype != np.float32:
+                df[c] = pd.to_numeric(df[c], errors='coerce').astype('float32')
+    top = sorted(fail_reasons.items(), key=lambda kv: -kv[1])[:3]
+    return df, dict(saved=saved, failed=failed, total=total, top_fail=[f'{k}（{v}檔）' for k, v in top],
+                    stopped=stopped, quota_wait_min=int(state['waited'] // 60))
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -2212,6 +2405,7 @@ def analyze_stock(sid, name, rows, bm, vp_params, extras_data):
     ir = extras_data.get('instRange')
     if ir:
         ex['inst3m'] = sum(m['net'] for m in ir)
+    ex.update(extras_data.get('instFlow') or {})
     pc = PatternCache(b)
     row, info = build_flag_row(b, e, bm, pc, vp_params, ex)
     return dict(stockId=sid, name=name, bars=b, row=row, info=info, total=info['dm']['score'], **extras_data)
@@ -2231,12 +2425,12 @@ def score_label(t):
     return '積極做多' if t >= 80 else '可考慮進場' if t >= 65 else '觀望' if t >= 50 else '不建議進場'
 
 
-# ── 組合型態：依命中類別（S/#/M/W/F）的組合分級，依據三年回測（20日報酬，含 t(依日) 檢驗，2026-10-02 統計） ──
-COMBO_STYLE_RULES = {'S#MWF': '進攻', 'SF': '進攻', 'SMF': '進攻', 'SWF': '進攻', '#MWF': '進攻', 'S#W': '穩健', '#WF': '穩健', '#MW': '穩健', 'M': '彩券', 'F': '彩券', 'MF': '彩券', '#M': '彩券', '#F': '彩券', '#MF': '彩券'}
+# ── 組合型態：依命中類別（S/#/M/W/F）的組合分級，依據三年回測（20日報酬，含 t(依日) 檢驗，2026-10-04 三段回測重新統計） ──
+COMBO_STYLE_RULES = {'S#MWF': '進攻', 'SWF': '進攻', 'SMF': '進攻', 'SMW': '進攻', 'SF': '進攻', '#MWF': '進攻', 'SMWF': '進攻', 'S#W': '穩健', 'SW': '穩健', '#WF': '穩健', '#MW': '穩健', 'M': '彩券', 'F': '彩券', 'MF': '彩券', '#M': '彩券', '#F': '彩券', '#MF': '彩券'}
 COMBO_STYLE_ICON = {'進攻': '🚀進攻', '穩健': '🛡️穩健', '彩券': '🎲彩券'}
-COMBO_STYLE_NOTE = {'進攻': '台股回測：20日超額+2.1~8.8%、飆股率8~18%，t(依日)2.5~5.7、前後半段都正；S#MWF最強（勝率62%、超額+8.8%、飆股率18%）',
-                    '穩健': '台股回測：20日勝率61~70%、跌>10%僅6~9%（全體13%）；穩在低回檔，超額不顯著（t(依日)≈1）',
-                    '彩券': '台股回測：20日勝率42~49%、跌>10%約16~23%，但少數大漲拉高平均，MF/#MF/F 期望值為正（t(依日)≈3.5）；小部位分散＋停損'}
+COMBO_STYLE_NOTE = {'進攻': '台股三段回測（2023-10～2026-09）：20日超額+3.1~8.8%、飆股率9~20%、t(依日)2.9~6.5；S#MWF最強（勝率60%、超額+8.8%、飆股率20%）',
+                    '穩健': '台股三段回測：20日跌>10%僅6~10%（全體14%）、勝率52~68%；穩在低回檔，超額小（+0.5~1.9%），S#W最佳（勝率68%）',
+                    '彩券': '台股三段回測：20日勝率42~52%、跌>10%約13~23%，但F／MF／#MF 期望值為正（t(依日)3.2~4.1）；小部位分散＋停損'}
 
 
 def combo_style(ms, mp, mm, mw, mf):
@@ -2672,7 +2866,7 @@ def batch_analyze(stocks, token, days, use_rt, ex_flags, vpp, delay=0.6, log=Non
                     pass
             if ex_flags.get('inst'):
                 try:
-                    extras['instRange'] = fetch_inst_monthly(sid, token)
+                    extras['instRange'], extras['instFlow'] = fetch_inst_monthly(sid, token, with_flow=True)
                 except Exception as ex2:  # noqa
                     extras['instRangeErr'] = str(ex2)
             r = analyze_stock(sid, names.get(sid, sid), rows, bm, vpp, extras)
@@ -3158,7 +3352,9 @@ def main():
         if up_sig and ss.get('bt_loaded_name') != up_sig:
             try:
                 with st.spinner(f'載入 {len(ups)} 個檔案中…'):
+                    release_bt_state(ss)
                     ss['bt_df'] = load_bt_files(ups)
+                    ss['bt_ver'] = ss.get('bt_ver', 0) + 1
                 ss['bt_loaded_name'] = up_sig
                 ss['bt_seg_label'] = ''
             except Exception as ex:  # noqa
@@ -3217,20 +3413,33 @@ def main():
             univ = {'上市清單': K['TWSE_LIST'], '上櫃清單': K['TPEX_LIST'],
                     '上市+上櫃': K['TWSE_LIST'] + K['TPEX_LIST'],
                     '目前輸入框清單': parse_stocks(ss['stocks_text'])}[bt_univ]
+            # 先釋放上一段回測留在 session 的資料（原始紀錄、壓縮檔、分析快取），
+            # 否則第2、3段跑的時候舊資料還佔著記憶體，Streamlit Cloud（約1GB）容易直接當掉
+            release_bt_state(ss)
             prog = st.progress(0.0, text='🔬 歷史回測執行中...')
             det = st.empty()
 
-            def onp(i, total, saved, failed, sid):
+            def onp(i, total, saved, failed, sid, note=None):
                 prog.progress(min(1.0, i / max(total, 1)),
                               text=f'🔬 歷史回測執行中（{bt_seg if bt_seg != BT_SEG_OPTIONS[0] else f"過去{bt_months}個月"}）：{i} / {total}')
-                det.caption((f'目前：{sid}　' if sid else '完成　') + f'已存 {saved:,} 筆　失敗 {failed} 檔')
+                det.caption((f'目前：{sid}　' if sid else '完成　') + f'已存 {saved:,} 筆　失敗 {failed} 檔'
+                            + (f'\n\n{note}' if note else ''))
             df, stt = run_backtest(token, univ, int(bt_months), bt_div, bt_inst, bt_liq * 10000, vpp,
                                    delay=bt_delay, on_progress=onp, end_offset_months=bt_off)
             ss['bt_seg_label'] = '' if bt_seg == BT_SEG_OPTIONS[0] else bt_seg.split('・')[1][:3]
             prog.empty()
             ss['bt_df'] = store_bt_df(df)
+            ss['bt_ver'] = ss.get('bt_ver', 0) + 1
             ss['bt_loaded_name'] = None
-            det.caption(f"回測完成：{stt['saved']:,} 筆評估紀錄，失敗 {stt['failed']} 檔")
+            det.caption(f"回測完成：{stt['saved']:,} 筆評估紀錄，失敗 {stt['failed']} 檔"
+                        + (f"（途中因 FinMind 額度用完暫停約 {stt['quota_wait_min']} 分鐘）" if stt.get('quota_wait_min') else ''))
+            if stt.get('stopped'):
+                st.error(f"⚠️ 回測提前結束：{stt['stopped']}")
+            if not len(df):
+                st.error('❌ 這次回測沒有產生任何評估紀錄。失敗原因：' + ('；'.join(stt.get('top_fail') or []) or '不明')
+                         + '。常見原因：Token 錯誤、FinMind 連線不到。')
+            elif stt['failed'] > max(20, stt['total'] * 0.2):
+                st.warning(f"⚠️ 有 {stt['failed']} 檔失敗（共 {stt['total']} 檔），結果可能不完整。主要原因：" + '；'.join(stt.get('top_fail') or []))
 
     tab_batch, tab_track, tab_bt = st.tabs(['📋 批次分析', '📈 命中追蹤', '🔬 歷史回測'])
     with tab_batch:
@@ -3247,7 +3456,7 @@ def get_live_combo_stats(ss, K):
     df = ss.get('bt_df')
     if df is None or not len(df):
         return None
-    sig = (id(df), len(df))
+    sig = (ss.get('bt_ver'), id(df), len(df))
     if ss.get('live_stats_sig') != sig:
         combos = K['STOCK_PICK_COMBOS'] + K['PINNED_COMBOS'] + K['MOONSHOT_COMBOS']
         ss['live_stats'] = compute_live_combo_stats(add_derived(df), combos)
@@ -3265,11 +3474,11 @@ def render_batch(st, ss, K):
     if live:
         st.caption('🧮 命中組合的 t值／勝率／飆股比例：使用本次程式內的回測即時計算（t值為同日調整，括號內為5/10/20日中最高的t）。')
     else:
-        st.caption('🧮 命中組合的 t值／勝率／飆股比例：尚未跑回測，先用回測記錄值（選股型 S 為 2023-10～2026-08 三年回測；沒進榜的組合沒有 t 值）；跑過回測或載入回測紀錄後會改用即時計算。')
+        st.caption('🧮 命中組合的 t值／勝率／飆股比例：尚未跑回測，先用回測記錄值（選股型 S 為 2023-10～2026-09 三年回測；沒進榜的組合沒有 t 值）；跑過回測或載入回測紀錄後會改用即時計算。')
     df = summary_frame(results, exf, K, live)
 
     with st.expander(f"「指定組合命中」編號對照：[選股型] S1~S{len(K['STOCK_PICK_COMBOS'])}　／　[高勝率] #1~#{len(K['PINNED_COMBOS'])}　／　[高標股] M1~M{len(K['MOONSHOT_COMBOS'])}"):
-        st.caption('S＝選股型：2023-10～2026-08 三年回測分三段（偏多／空頭／多頭），每一段扣掉同一天大盤後都仍有超額報酬（t≥2），最值得看。'
+        st.caption('S＝選股型：2023-10～2026-09 三年回測分三段（偏多／空頭／多頭），每一段扣掉同一天大盤後都仍有超額報酬（t≥2），最值得看。'
                    '#＝高勝率；標 ⏱ 的是擇時型（含布林低檔／大盤跌破均線），勝率主要來自大盤反彈，適合判斷大盤落底，不適合當選股依據。'
                    '⚠️ #、M 的歷史統計是舊版（VAH/VAL 分價量表、夜星未限高檔）時期記錄的。')
         t0 = pd.DataFrame([{'編號': f'S{i + 1}', '條件組合': '＋'.join(c),
@@ -3284,8 +3493,8 @@ def render_batch(st, ss, K):
                            for i, c in enumerate(K['MOONSHOT_COMBOS'])])
         st.dataframe(t1, hide_index=True, use_container_width=True, height=240)
         st.dataframe(t2, hide_index=True, use_container_width=True, height=240)
-        st.caption(f"🔵 W＝回測高勝率（{len(K.get('BT_WIN_COMBOS', []))}組，青色）：三年回測任一天期勝率>60% 且 t>2；標 ⏱ 的是擇時型。"
-                   f"　🔴 F＝回測飆股（{len(K.get('BT_HOT_COMBOS', []))}組，粉紅色）：10/20日飆股比例>10% 且飆股次數≥10。摘要表每類只顯示最強的{BT_HIT_SHOW}個，其餘以 +N 表示。"
+        st.caption(f"🔵 W＝回測高勝率（{len(K.get('BT_WIN_COMBOS', []))}組，青色）：三年三段回測任一天期勝率>55%、t>2，且三段各自 t≥2；標 ⏱ 的是擇時型。"
+                   f"　🔴 F＝回測飆股（{len(K.get('BT_HOT_COMBOS', []))}組，粉紅色）：10/20日飆股比例>10%、飆股次數≥10，且三段飆股比例都≥2倍基準。摘要表每類只顯示最強的{BT_HIT_SHOW}個，其餘以 +N 表示。"
                    "　🔢 命中類別數＝S/#/M/W/F 五類中命中幾類；同類組合常共用同一訊號，類別數比總命中數更能反映強度（回測：≥3類 台股20日超額約+2~4%、美股+0.6~1.8%，但波動也較大）。"
                    "　🏷️ 組合型態（依命中類別組合分級）：" + '　'.join(f"{COMBO_STYLE_ICON[k]}＝{'、'.join(c for c, v in COMBO_STYLE_RULES.items() if v == k)}（{COMBO_STYLE_NOTE[k]}）" for k in ('進攻', '穩健', '彩券')) + "；其他組合不標示。")
         tw_ = pd.DataFrame([{'編號': f'W{i + 1}', '類型': combo_type_label(c), '條件組合': '＋'.join(c),
@@ -3578,13 +3787,13 @@ def render_backtest(st, ss, K):
         st.warning(f'⚠️ 資料量 {len(df):,} 筆偏大，Streamlit Cloud（記憶體約1GB）可能跑不動而當掉。'
                    '可以先只載入其中兩段，或回測時提高流動性門檻／最低股價減少筆數。')
     # 原始紀錄檔按了才產生（全美股約20萬筆，每次重跑都先壓一次檔會多花十幾秒和幾百MB記憶體）
-    if ss.get('_bt_csv_sig') == id(ss.get('bt_df')) and ss.get('_bt_csv'):
+    if ss.get('_bt_csv_sig') == ss.get('bt_ver') and ss.get('_bt_csv'):
         st.download_button('💾 下載回測原始紀錄（.csv.gz，之後可直接載入，不用重抓）', ss['_bt_csv'],
                            file_name=f'回測原始紀錄{("_" + ss["bt_seg_label"]) if ss.get("bt_seg_label") else ""}_{dt.date.today()}.csv.gz', key='dl_btcsv')
     elif st.button('💾 產生回測原始紀錄檔（之後可直接載入，不用重抓）', key='mk_btcsv'):
         with st.spinner('壓縮中…'):
             ss['_bt_csv'] = bt_csv_gz(df)
-            ss['_bt_csv_sig'] = id(ss.get('bt_df'))
+            ss['_bt_csv_sig'] = ss.get('bt_ver')
         st.rerun()
 
     def show(title, t, note=None):
@@ -3822,34 +4031,36 @@ TW0050_LIST = [
     "1216", "3045", "4904", "2379", "3034", "1102", "2610", "2618", "2603", "2609", "2615",
 ]
 
-# 選股型指定組合（S編號）：2023-10～2026-08 台股三年回測（分三段：偏多／空頭／多頭），三段的同日調整 t 值都 ≥2 的組合
+# 選股型指定組合（S編號）：2023-10～2026-09 台股三年回測（分三段：偏多／空頭／多頭），三段的同日調整 t 值都 ≥2 的組合
 # （2026-09-30 改版；舊版 S1～S7 多數只在多頭年有效，已移除或改列高標股 M）
 STOCK_PICK_COMBOS = [
     ["距52週高點≤5%", "近3日向上跳空缺口", "近3月乖離度為正(營收優於股價)"],
     ["創52週新高", "近3日向上跳空缺口", "近3月乖離度為正(營收優於股價)"],
     ["相對強弱為正(強於大盤)", "量能區間低檔(≤10百分位)", "距52週高點≤5%"],
     ["地量(≤0.5倍均量)", "近3日向上跳空缺口", "三大法人近3月買超"],
-    ["多方力道≥80", "三大法人近3月買超", "N字底剛形成"],
+    ["多方力道≥80", "地量(≤0.5倍均量)", "距52週高點≤5%"],
+
 ]
 STOCK_PICK_STATS = {
-    "距52週高點≤5% ＋ 近3日向上跳空缺口 ＋ 近3月乖離度為正(營收優於股價)": {"10": {"n": 3898, "win": 54.4, "ret": 3.23, "ex": 2.63, "t": 12.04}, "20": {"n": 3898, "win": 54.5, "ret": 5.06, "ex": 3.63, "t": 11.73}},
-    "創52週新高 ＋ 近3日向上跳空缺口 ＋ 近3月乖離度為正(營收優於股價)": {"10": {"n": 2708, "win": 53.3, "ret": 3.64, "ex": 3.03, "t": 10.35}, "20": {"n": 2708, "win": 52.7, "ret": 5.39, "ex": 3.96, "t": 9.53}},
-    "相對強弱為正(強於大盤) ＋ 量能區間低檔(≤10百分位) ＋ 距52週高點≤5%": {"10": {"n": 638, "win": 58.0, "ret": 2.32, "ex": 2.17, "t": 6.16}, "20": {"n": 638, "win": 56.4, "ret": 3.46, "ex": 2.27, "t": 4.85}},
-    "地量(≤0.5倍均量) ＋ 近3日向上跳空缺口 ＋ 三大法人近3月買超": {"10": {"n": 2944, "win": 54.8, "ret": 2.71, "ex": 1.52, "t": 6.77}, "20": {"n": 2941, "win": 54.5, "ret": 4.17, "ex": 1.97, "t": 5.78}},
-    "多方力道≥80 ＋ 三大法人近3月買超 ＋ N字底剛形成": {"10": {"n": 988, "win": 52.3, "ret": 2.83, "ex": 2.32, "t": 5.41}, "20": {"n": 988, "win": 49.2, "ret": 4.09, "ex": 2.84, "t": 4.74}},
+    "距52週高點≤5% ＋ 近3日向上跳空缺口 ＋ 近3月乖離度為正(營收優於股價)": {"10": {"n": 3812, "win": 54.4, "ret": 3.31, "ex": 2.68, "t": 11.94}, "20": {"n": 3812, "win": 54.1, "ret": 5.18, "ex": 3.71, "t": 11.64}},
+    "創52週新高 ＋ 近3日向上跳空缺口 ＋ 近3月乖離度為正(營收優於股價)": {"10": {"n": 2695, "win": 53.4, "ret": 3.8, "ex": 3.16, "t": 10.58}, "20": {"n": 2695, "win": 52.5, "ret": 5.6, "ex": 4.11, "t": 9.72}},
+    "相對強弱為正(強於大盤) ＋ 量能區間低檔(≤10百分位) ＋ 距52週高點≤5%": {"10": {"n": 604, "win": 57.5, "ret": 2.35, "ex": 2.29, "t": 6.17}, "20": {"n": 604, "win": 56.5, "ret": 3.67, "ex": 2.57, "t": 5.27}},
+    "地量(≤0.5倍均量) ＋ 近3日向上跳空缺口 ＋ 三大法人近3月買超": {"10": {"n": 2873, "win": 55.5, "ret": 2.99, "ex": 1.74, "t": 7.51}, "20": {"n": 2873, "win": 55.2, "ret": 4.5, "ex": 2.23, "t": 6.33}},
+    "多方力道≥80 ＋ 地量(≤0.5倍均量) ＋ 距52週高點≤5%": {"10": {"n": 1843, "win": 52.9, "ret": 2.76, "ex": 2.34, "t": 7.64}, "20": {"n": 1843, "win": 55.1, "ret": 5.38, "ex": 4.28, "t": 9.16}},
+
 }
 
 # 2026-09-27 台股回測（勝率榜5/10/20日＋飆股榜5/10/20日）中，指定組合的勝率／t值(同日調整)／飆股比例記錄值
 # key＝條件依字元排序後以「 ＋ 」連接
 COMBO_REF_STATS = {
-    # ── 2026-09-30 三年回測（2023-10～2026-08）新增組合的記錄值 ──
-    "距52週高點≤5% ＋ 近3日向上跳空缺口 ＋ 近3月乖離度為正(營收優於股價)": {"win": {"5": 52.6, "10": 54.4, "20": 54.5}, "t": {"5": 9.27, "10": 12.04, "20": 11.73}, "moon": {"10": 4.8, "20": 9.3}},
-    "創52週新高 ＋ 近3日向上跳空缺口 ＋ 近3月乖離度為正(營收優於股價)": {"win": {"5": 52.1, "10": 53.3, "20": 52.7}, "t": {"5": 7.24, "10": 10.35, "20": 9.53}, "moon": {"10": 6.4, "20": 11.5}},
-    "相對強弱為正(強於大盤) ＋ 距52週高點≤5% ＋ 量能區間低檔(≤10百分位)": {"win": {"5": 58.5, "10": 58.0, "20": 56.4}, "t": {"5": 5.47, "10": 6.16, "20": 4.85}, "moon": {"10": 1.3, "20": 4.7}},
-    "三大法人近3月買超 ＋ 地量(≤0.5倍均量) ＋ 近3日向上跳空缺口": {"win": {"5": 53.2, "10": 54.8, "20": 54.5}, "t": {"5": 5.07, "10": 6.77, "20": 5.78}, "moon": {"10": 3.7, "20": 7.3}},
+    # ── 2026-10-04 三年三段回測（2023-10～2026-09）：S1～S5 的記錄值已更新 ──
+    "距52週高點≤5% ＋ 近3日向上跳空缺口 ＋ 近3月乖離度為正(營收優於股價)": {"win": {"5": 52.4, "10": 54.4, "20": 54.1}, "t": {"5": 9.11, "10": 11.94, "20": 11.64}, "moon": {"10": 5.2, "20": 9.6}},
+    "創52週新高 ＋ 近3日向上跳空缺口 ＋ 近3月乖離度為正(營收優於股價)": {"win": {"5": 52.2, "10": 53.4, "20": 52.5}, "t": {"5": 7.25, "10": 10.58, "20": 9.72}, "moon": {"10": 6.8, "20": 11.9}},
+    "相對強弱為正(強於大盤) ＋ 距52週高點≤5% ＋ 量能區間低檔(≤10百分位)": {"win": {"5": 56.8, "10": 57.5, "20": 56.5}, "t": {"5": 5.31, "10": 6.17, "20": 5.27}, "moon": {"10": 1.3, "20": 5.0}},
+    "三大法人近3月買超 ＋ 地量(≤0.5倍均量) ＋ 近3日向上跳空缺口": {"win": {"5": 53.9, "10": 55.5, "20": 55.2}, "t": {"5": 6.17, "10": 7.51, "20": 6.33}, "moon": {"10": 4.0, "20": 7.8}},
     "N字底剛形成 ＋ 三大法人近3月買超 ＋ 多方力道≥80": {"win": {"5": 49.9, "10": 52.3, "20": 49.2}, "t": {"5": 4.7, "10": 5.41, "20": 4.74}, "moon": {"10": 5.7, "20": 9.9}},
-    "地量(≤0.5倍均量) ＋ 多方力道≥80 ＋ 強勢突破盤": {"win": {"5": 54.8, "10": 57.5, "20": 60.1}, "t": {"5": 4.13, "10": 4.91, "20": 6.07}, "moon": {"10": 11.0, "20": 20.9}},
-    "多方力道≥80 ＋ 晨星剛形成 ＋ 量能斜率轉弱(近5日均量<近10日均量20%以上)": {"win": {"5": 47.0, "10": 48.7, "20": 49.6}, "t": {"5": 1.9, "10": 1.67, "20": 2.17}, "moon": {"10": 10.4, "20": 20.9}},
+    "地量(≤0.5倍均量) ＋ 多方力道≥80 ＋ 強勢突破盤": {"win": {"20": 60.2}, "t": {"20": 6.52}, "moon": {"10": 10.7, "20": 21.0}},
+    "多方力道≥80 ＋ 晨星剛形成 ＋ 量能斜率轉弱(近5日均量<近10日均量20%以上)": {"moon": {"10": 11.0, "20": 22.0}},
     "創52週新高 ＋ 地量(≤0.5倍均量) ＋ 近3日向上跳空缺口": {"win": {"5": 55.4, "10": 55.7, "20": 57.5}, "t": {"5": 4.63, "10": 5.41, "20": 5.27}, "moon": {"10": 11.7, "20": 19.3}},
     "大盤跌破60日均線 ＋ 相對強弱為負(弱於大盤) ＋ 近3日向上跳空缺口": {"win": {"5": 57.6, "10": 71.1, "20": 72.9}, "t": {"5": 0.2, "10": 4.87, "20": 7.35}, "moon": {"10": 0.7, "20": 4.3}},
     "KDJ近3日內死亡交叉 ＋ KDJ近3日內黃金交叉 ＋ 夜星剛形成": {"moon": {"20": 10.5}},
@@ -4193,7 +4404,6 @@ COMBO_REF_STATS = {
     "地量(≤0.5倍均量) ＋ 多方力道≥65 ＋ 母子懷抱(高檔)剛形成": {"moon": {"20": 13.3}},
     "地量(≤0.5倍均量) ＋ 多方力道≥80 ＋ 夜星剛形成": {"moon": {"10": 17.4, "20": 17.4}},
     "地量(≤0.5倍均量) ＋ 多方力道≥80 ＋ 布林通道高檔(≥80%)": {"moon": {"20": 12.4}},
-    "地量(≤0.5倍均量) ＋ 多方力道≥80 ＋ 強勢突破盤": {"win": {"20": 60.2}, "t": {"20": 6.52}, "moon": {"10": 10.7, "20": 21.0}},
     "地量(≤0.5倍均量) ＋ 多方力道≥80 ＋ 晨星剛形成": {"moon": {"10": 10.3, "20": 22.4}},
     "地量(≤0.5倍均量) ＋ 多方力道≥80 ＋ 母子懷抱(低檔)剛形成": {"moon": {"20": 11.5}},
     "地量(≤0.5倍均量) ＋ 多方力道≥80 ＋ 母子懷抱(高檔)剛形成": {"moon": {"20": 11.4}},
@@ -4292,7 +4502,6 @@ COMBO_REF_STATS = {
     "多方力道≥80 ＋ 晨星剛形成 ＋ 近3月均價YoY為正": {"moon": {"10": 10.0, "20": 15.2}},
     "多方力道≥80 ＋ 晨星剛形成 ＋ 近3月均價YoY為負": {"moon": {"20": 11.5}},
     "多方力道≥80 ＋ 晨星剛形成 ＋ 量能區間高檔(≥90百分位)": {"moon": {"20": 10.2}},
-    "多方力道≥80 ＋ 晨星剛形成 ＋ 量能斜率轉弱(近5日均量<近10日均量20%以上)": {"moon": {"10": 11.0, "20": 22.0}},
     "多方力道≥80 ＋ 晨星剛形成 ＋ 量能斜率轉強(近5日均量>近10日均量20%以上)": {"moon": {"20": 10.3}},
     "多方力道≥80 ＋ 母子懷抱(低檔)剛形成 ＋ 近3月乖離度為負(股價超前營收)": {"moon": {"20": 11.0}},
     "多方力道≥80 ＋ 母子懷抱(低檔)剛形成 ＋ 量能斜率轉弱(近5日均量<近10日均量20%以上)": {"moon": {"20": 10.6}},
@@ -4539,6 +4748,8 @@ COMBO_REF_STATS = {
     "母子懷抱(低檔)剛形成 ＋ 突破飆股大量黑K最高點剛形成 ＋ 量能區間高檔(≥90百分位)": {"moon": {"20": 12.2}},
     "母子懷抱(低檔)剛形成 ＋ 突破飆股大量黑K最高點剛形成 ＋ 量能斜率轉強(近5日均量>近10日均量20%以上)": {"moon": {"20": 13.8}},
     "母子懷抱(高檔)剛形成 ＋ 相對強弱為正(強於大盤) ＋ 量能斜率轉弱(近5日均量<近10日均量20%以上)": {"moon": {"20": 10.1}},
+    "地量(≤0.5倍均量) ＋ 多方力道≥80 ＋ 距52週高點≤5%": {"win": {"5": 51.9, "10": 52.9, "20": 55.1}, "t": {"5": 6.31, "10": 7.64, "20": 9.16}, "moon": {"10": 4.4, "20": 11.1}},
+
 }
 
 # 高勝率指定組合（#編號）與歷史勝率記錄（舊版定義下的回測數字）
@@ -6528,913 +6739,657 @@ MOONSHOT_COMBO_STATS = {
 
 
 
-# ── 回測自動入選組合（2026-09-30，台股 2023-10～2026-08 三年回測）──
+# ── 回測自動入選組合（2026-10-04 三段驗證；原 2026-09-30，台股 2023-10～2026-09 三年回測）──
 # W＝回測高勝率：5/10/20日任一天期勝率>60% 且 t值(同日調整)>2（樣本數≥50）；依最高 t 值排序
 # F＝回測飆股：10/20日飆股(漲幅>30%)比例>10% 且飆股次數≥10；依最高飆股比例排序
 # 已在 S／#／M 清單裡的組合不重複列入；含已刪除條件（布林通道收窄）的組合不列入
 BT_WIN_COMBOS = [
-    ["布林通道低檔(≤20%)", "大盤跌破60日均線", "近3日向上跳空缺口"],
-    ["大盤跌破60日均線", "近3日向上跳空缺口", "近3月均價YoY為正"],
-    ["布林通道低檔(≤20%)", "大盤跌破20日均線", "近3日向上跳空缺口"],
+    ["相對強弱為負(弱於大盤)", "大盤跌破20日均線", "近3月均價YoY為正"],
+    ["相對強弱為正(強於大盤)", "地量(≤0.5倍均量)", "距52週高點≤5%"],
+    ["相對強弱為負(弱於大盤)", "大盤跌破20日均線", "外資近5日買超"],
+    ["KDJ近3日內死亡交叉", "相對強弱為負(弱於大盤)", "大盤跌破20日均線"],
+    ["相對強弱為負(弱於大盤)", "大盤跌破20日均線", "三大法人近3月買超"],
+    ["相對強弱為負(弱於大盤)", "大盤跌破60日均線", "外資近5日買超"],
     ["相對強弱為負(弱於大盤)", "大盤跌破20日均線", "近3日向上跳空缺口"],
+    ["布林通道低檔(≤20%)", "大盤跌破20日均線", "近3日向上跳空缺口"],
+    ["強勢突破盤", "地量(≤0.5倍均量)", "DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR)"],
     ["強勢突破盤", "地量(≤0.5倍均量)", "創52週新高"],
+    ["量能區間低檔(≤10百分位)", "距52週高點≤5%", "均線多頭排列(5>20>60且站上月線)"],
+    ["強勢突破盤", "地量(≤0.5倍均量)", "均線多頭排列(5>20>60且站上月線)"],
     ["強勢突破盤", "地量(≤0.5倍均量)", "近3日向上跳空缺口"],
-    ["布林通道低檔(≤20%)", "近3日向上跳空缺口", "近3月均價YoY為正"],
-    ["KDJ近3日內黃金交叉", "大盤跌破20日均線", "近3日向上跳空缺口"],
-    ["布林通道低檔(≤20%)", "近3日向上跳空缺口", "三大法人近3月買超"],
-    ["布林通道低檔(≤20%)", "量能斜率轉弱(近5日均量<近10日均量20%以上)", "近3日向上跳空缺口"],
-    ["布林通道低檔(≤20%)", "相對強弱為負(弱於大盤)", "近3日向上跳空缺口"],
-    ["布林通道低檔(≤20%)", "近3日向上跳空缺口"],
-    ["大盤跌破60日均線", "近3日向上跳空缺口"],
-    ["大盤跌破20日均線", "大盤跌破60日均線", "近3日向上跳空缺口"],
-    ["相對強弱為負(弱於大盤)", "大盤跌破60日均線"],
-    ["量能斜率轉弱(近5日均量<近10日均量20%以上)", "大盤跌破20日均線", "近3日向上跳空缺口"],
-    ["多方力道≥80", "量能區間低檔(≤10百分位)", "距52週高點≤5%"],
-    ["量能區間低檔(≤10百分位)", "近3日向上跳空缺口", "近3月均價YoY為正"],
-    ["量能區間低檔(≤10百分位)", "近3日向上跳空缺口", "三大法人近3月買超"],
-    ["地量(≤0.5倍均量)", "大盤跌破20日均線", "近3日向上跳空缺口"],
-    ["地量(≤0.5倍均量)", "創52週新高", "三大法人近3月賣超"],
-    ["布林通道低檔(≤20%)", "量能區間低檔(≤10百分位)", "近3日向上跳空缺口"],
+    ["相對強弱為負(弱於大盤)", "大盤跌破20日均線", "投信連續買超≥3日"],
+    ["量能區間低檔(≤10百分位)", "距52週高點≤5%", "近3月均價YoY為正"],
+    ["量能區間低檔(≤10百分位)", "距52週高點≤5%", "三大法人近3月買超"],
+    ["地量(≤0.5倍均量)", "近3日向上跳空缺口", "外資近5日買超"],
+    ["量能區間低檔(≤10百分位)", "距52週高點≤5%", "外資近5日買超"],
+    ["相對強弱為負(弱於大盤)", "大盤跌破20日均線"],
+    ["多方力道≥65", "量能區間低檔(≤10百分位)", "距52週高點≤5%"],
+    ["量能區間低檔(≤10百分位)", "距52週高點≤5%", "土洋同買(外資、投信近5日皆買超)"],
+    ["大盤跌破20日均線", "近3日向上跳空缺口", "近3月乖離度為正(營收優於股價)"],
+    ["多方力道≥65", "土洋同買(外資、投信近5日皆買超)", "N字底剛形成"],
+    ["土洋同買(外資、投信近5日皆買超)", "DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR)", "N字底剛形成"],
+    ["創52週新高", "近3月乖離度為正(營收優於股價)", "圓弧底剛形成"],
+    ["近3月乖離度為正(營收優於股價)", "近3月均價YoY為正", "N字底剛形成"],
+    ["相對強弱為負(弱於大盤)", "大盤跌破20日均線", "連續放量(近3日均量≥1.5倍前20日均量)"],
     ["近3日向上跳空缺口", "近3月乖離度為負(股價超前營收)", "母子懷抱(低檔)剛形成"],
-    ["布林通道低檔(≤20%)", "地量(≤0.5倍均量)", "近3日向上跳空缺口"],
-    ["布林通道低檔(≤20%)", "KDJ近3日內黃金交叉", "近3日向上跳空缺口"],
-    ["量能區間低檔(≤10百分位)", "創52週新高", "三大法人近3月買超"],
-    ["布林通道高檔(≥80%)", "量能區間低檔(≤10百分位)", "創52週新高"],
-    ["布林通道低檔(≤20%)", "近3日向上跳空缺口", "近3月乖離度為負(股價超前營收)"],
-    ["相對強弱為正(強於大盤)", "量能區間低檔(≤10百分位)", "創52週新高"],
-    ["量能區間低檔(≤10百分位)", "創52週新高"],
-    ["量能區間低檔(≤10百分位)", "大盤站上60日均線", "創52週新高"],
-    ["量能區間低檔(≤10百分位)", "創52週新高", "距52週高點≤5%"],
-    ["布林通道低檔(≤20%)", "近3日向上跳空缺口", "近3月乖離度為正(營收優於股價)"],
     ["地量(≤0.5倍均量)", "量能斜率轉強(近5日均量>近10日均量20%以上)", "創52週新高"],
-    ["創52週新高", "近3日向上跳空缺口", "三重底剛形成"],
-    ["量能區間低檔(≤10百分位)", "大盤跌破20日均線", "近3日向上跳空缺口"],
-    ["地量(≤0.5倍均量)", "大盤跌破60日均線", "近3日向上跳空缺口"],
-    ["量能區間低檔(≤10百分位)", "創52週新高", "近3月乖離度為負(股價超前營收)"],
-    ["量能區間低檔(≤10百分位)", "近3日向上跳空缺口", "近3月乖離度為負(股價超前營收)"],
-    ["量能區間低檔(≤10百分位)", "大盤跌破60日均線", "近3日向上跳空缺口"],
-    ["量能區間低檔(≤10百分位)", "大盤站上20日均線", "創52週新高"],
-    ["近3日向上跳空缺口", "母子懷抱(低檔)剛形成"],
-    ["多方力道≥65", "量能區間低檔(≤10百分位)", "創52週新高"],
-    ["大盤跌破60日均線", "近3日向上跳空缺口", "近3月乖離度為負(股價超前營收)"],
-    ["相對強弱為負(弱於大盤)", "創52週新高", "圓弧底剛形成"],
-    ["KDJ近3日內死亡交叉", "創52週新高", "圓弧底剛形成"],
-    ["KDJ近3日內黃金交叉", "大盤跌破60日均線", "近3日向上跳空缺口"],
-    ["多方力道≥80", "量能區間高檔(≥90百分位)", "複式頭肩底剛形成"],
-    ["KDJ近3日內黃金交叉", "近3日向上跳空缺口", "母子懷抱(低檔)剛形成"],
-    ["距52週高點≤5%", "三重底剛形成", "圓弧底剛形成"],
-    ["創52週新高", "三重底剛形成", "圓弧底剛形成"],
-    ["大盤跌破60日均線", "創52週新高", "圓弧底剛形成"],
-    ["強勢突破盤", "量能區間低檔(≤10百分位)", "距52週高點≤5%"],
-    ["KDJ近3日內死亡交叉", "近3日向上跳空缺口", "母子懷抱(低檔)剛形成"],
-    ["近3日向上跳空缺口", "近3月均價YoY為正", "母子懷抱(低檔)剛形成"],
-    ["大盤站上20日均線", "近3日向上跳空缺口", "母子懷抱(低檔)剛形成"],
-    ["相對強弱為負(弱於大盤)", "距52週高點≤5%", "突破飆股大量黑K最高點剛形成"],
-    ["地量(≤0.5倍均量)", "近3日向上跳空缺口", "母子懷抱(低檔)剛形成"],
-    ["近3日向上跳空缺口", "三大法人近3月賣超", "母子懷抱(低檔)剛形成"],
-    ["大盤站上60日均線", "近3日向上跳空缺口", "母子懷抱(低檔)剛形成"],
-    ["大盤站上20日均線", "距52週高點≤5%", "複式頭肩底剛形成"],
-    ["距52週高點≤5%", "近3月乖離度為正(營收優於股價)", "複式頭肩底剛形成"],
-    ["近3日向上跳空缺口", "三大法人近3月買超", "母子懷抱(低檔)剛形成"],
-    ["大盤跌破60日均線", "近3日向上跳空缺口", "母子懷抱(低檔)剛形成"],
-    ["KDJ近3日內死亡交叉", "量能斜率轉弱(近5日均量<近10日均量20%以上)", "近3日向上跳空缺口"],
-    ["多方力道≥80", "創52週新高", "一字底(均線糾結)剛形成"],
-    ["布林通道低檔(≤20%)", "近3日向上跳空缺口", "三大法人近3月賣超"],
-    ["創52週新高", "圓弧底剛形成", "突破ABC修正下降切線剛形成"],
-    ["距52週高點≤5%", "複式頭肩底剛形成"],
-    ["大盤站上60日均線", "距52週高點≤5%", "複式頭肩底剛形成"],
-    ["創52週新高", "圓弧底剛形成", "一字底(均線糾結)剛形成"],
-    ["距52週高點≤5%", "複式頭肩底剛形成", "三重底剛形成"],
-    ["距52週高點≤5%", "N字底剛形成", "一字底(均線糾結)剛形成"],
-    ["相對強弱為負(弱於大盤)", "創52週新高", "N字底剛形成"],
-    ["相對強弱為負(弱於大盤)", "近3日向上跳空缺口", "母子懷抱(低檔)剛形成"],
-    ["多方力道≥65", "距52週高點≤5%", "頭肩底剛形成"],
-    ["大盤跌破20日均線", "近3日向上跳空缺口", "夜星剛形成"],
-    ["距52週高點≤5%", "三大法人近3月買超", "複式頭肩底剛形成"],
-    ["近3日向上跳空缺口", "近3月均價YoY為負", "母子懷抱(低檔)剛形成"],
+    ["量能區間低檔(≤10百分位)", "近3日向上跳空缺口", "近3月均價YoY為正"],
+    ["地量(≤0.5倍均量)", "創52週新高", "三大法人近3月賣超"],
+
 ]
 BT_WIN_STATS = {
-    "地量(≤0.5倍均量) ＋ 創52週新高 ＋ 三大法人近3月賣超": {"5": {"n": 57, "win": 63.2, "ex": 6.37, "t": 3.56}, "10": {"n": 57, "win": 61.4, "ex": 10.18, "t": 3.65}, "20": {"n": 57, "win": 71.9, "ex": 14.36, "t": 3.85}},
-    "布林通道高檔(≥80%) ＋ 量能區間低檔(≤10百分位) ＋ 創52週新高": {"5": {"n": 71, "win": 63.4, "ex": 3.78, "t": 3.19}, "10": {"n": 71, "win": 66.2, "ex": 5.58, "t": 3.72}, "20": {"n": 71, "win": 66.2, "ex": 6.76, "t": 3.16}},
-    "地量(≤0.5倍均量) ＋ 量能斜率轉強(近5日均量>近10日均量20%以上) ＋ 創52週新高": {"5": {"n": 71, "win": 70.4, "ex": 5.1, "t": 3.16}, "10": {"n": 71, "win": 64.8, "ex": 7.74, "t": 3.47}, "20": {"n": 70, "win": 60.0, "ex": 8.64, "t": 3.13}},
-    "量能區間低檔(≤10百分位) ＋ 創52週新高 ＋ 三大法人近3月買超": {"5": {"n": 74, "win": 64.9, "ex": 3.39, "t": 3.13}, "10": {"n": 74, "win": 66.2, "ex": 5.36, "t": 3.73}, "20": {"n": 74, "win": 66.2, "ex": 6.09, "t": 3.04}},
-    "相對強弱為正(強於大盤) ＋ 量能區間低檔(≤10百分位) ＋ 創52週新高": {"5": {"n": 75, "win": 62.7, "ex": 3.53, "t": 3.11}, "10": {"n": 75, "win": 64.0, "ex": 5.2, "t": 3.64}, "20": {"n": 75, "win": 66.7, "ex": 6.43, "t": 3.19}},
-    "量能區間低檔(≤10百分位) ＋ 創52週新高": {"5": {"n": 78, "win": 62.8, "ex": 3.44, "t": 3.1}, "10": {"n": 78, "win": 64.1, "ex": 5.02, "t": 3.58}, "20": {"n": 78, "win": 66.7, "ex": 6.33, "t": 3.2}},
-    "多方力道≥80 ＋ 量能區間高檔(≥90百分位) ＋ 複式頭肩底剛形成": {"5": {"n": 64, "win": 60.9, "ex": 3.61, "t": 2.96}, "10": {"n": 64, "win": 60.9, "ex": 3.38, "t": 2.26}, "20": {"n": 64, "win": 56.2, "ex": 2.25, "t": 1.34}},
-    "量能區間低檔(≤10百分位) ＋ 創52週新高 ＋ 距52週高點≤5%": {"5": {"n": 73, "win": 64.4, "ex": 3.18, "t": 2.95}, "10": {"n": 73, "win": 64.4, "ex": 5.03, "t": 3.51}, "20": {"n": 73, "win": 67.1, "ex": 6.16, "t": 3.01}},
-    "量能區間低檔(≤10百分位) ＋ 創52週新高 ＋ 近3月乖離度為負(股價超前營收)": {"5": {"n": 65, "win": 61.5, "ex": 3.51, "t": 2.76}, "10": {"n": 65, "win": 63.1, "ex": 4.72, "t": 3.02}, "20": {"n": 65, "win": 70.8, "ex": 7.54, "t": 3.3}},
-    "量能區間低檔(≤10百分位) ＋ 大盤站上20日均線 ＋ 創52週新高": {"5": {"n": 72, "win": 63.9, "ex": 2.96, "t": 2.68}, "10": {"n": 72, "win": 63.9, "ex": 4.68, "t": 3.24}, "20": {"n": 72, "win": 66.7, "ex": 5.62, "t": 2.78}},
-    "多方力道≥65 ＋ 量能區間低檔(≤10百分位) ＋ 創52週新高": {"5": {"n": 58, "win": 63.8, "ex": 3.51, "t": 2.64}, "10": {"n": 58, "win": 67.2, "ex": 5.15, "t": 3.21}, "20": {"n": 58, "win": 65.5, "ex": 7.34, "t": 2.89}},
-    "量能區間低檔(≤10百分位) ＋ 大盤跌破60日均線 ＋ 近3日向上跳空缺口": {"5": {"n": 1035, "win": 65.0, "ex": 0.37, "t": 2.57}, "10": {"n": 1035, "win": 62.9, "ex": 0.47, "t": 2.56}, "20": {"n": 1035, "win": 67.2, "ex": 0.96, "t": 3.26}},
-    "地量(≤0.5倍均量) ＋ 大盤跌破60日均線 ＋ 近3日向上跳空缺口": {"5": {"n": 1780, "win": 62.4, "ex": 0.32, "t": 2.55}, "10": {"n": 1781, "win": 64.6, "ex": 0.58, "t": 3.4}, "20": {"n": 1781, "win": 65.2, "ex": 0.6, "t": 2.36}},
-    "布林通道低檔(≤20%) ＋ 量能區間低檔(≤10百分位) ＋ 近3日向上跳空缺口": {"5": {"n": 273, "win": 65.2, "ex": 0.97, "t": 2.54}, "10": {"n": 273, "win": 65.6, "ex": 1.68, "t": 3.85}, "20": {"n": 273, "win": 68.9, "ex": 1.37, "t": 2.12}},
-    "多方力道≥65 ＋ 距52週高點≤5% ＋ 頭肩底剛形成": {"5": {"n": 51, "win": 66.7, "ex": 1.98, "t": 2.13}, "10": {"n": 51, "win": 60.8, "ex": 1.61, "t": 1.36}, "20": {"n": 51, "win": 54.9, "ex": 1.08, "t": 0.68}},
-    "大盤跌破60日均線 ＋ 近3日向上跳空缺口 ＋ 母子懷抱(低檔)剛形成": {"5": {"n": 78, "win": 71.8, "ex": 1.42, "t": 2.02}, "10": {"n": 78, "win": 76.9, "ex": 2.0, "t": 2.19}, "20": {"n": 78, "win": 69.2, "ex": 3.68, "t": 2.54}},
-    "相對強弱為負(弱於大盤) ＋ 大盤跌破20日均線 ＋ 近3日向上跳空缺口": {"5": {"n": 5524, "win": 54.1, "ex": -0.17, "t": -2.3}, "10": {"n": 5523, "win": 65.6, "ex": 0.66, "t": 6.62}, "20": {"n": 5525, "win": 69.2, "ex": 0.92, "t": 6.11}},
-    "布林通道低檔(≤20%) ＋ 大盤跌破20日均線 ＋ 近3日向上跳空缺口": {"5": {"n": 1807, "win": 62.1, "ex": -0.05, "t": -0.38}, "10": {"n": 1806, "win": 72.3, "ex": 1.05, "t": 6.44}, "20": {"n": 1807, "win": 77.6, "ex": 1.59, "t": 6.71}},
-    "布林通道低檔(≤20%) ＋ 大盤跌破60日均線 ＋ 近3日向上跳空缺口": {"5": {"n": 1375, "win": 64.3, "ex": 0.25, "t": 1.83}, "10": {"n": 1374, "win": 77.1, "ex": 1.15, "t": 6.41}, "20": {"n": 1375, "win": 82.8, "ex": 1.77, "t": 6.91}},
-    "大盤跌破60日均線 ＋ 近3日向上跳空缺口 ＋ 近3月均價YoY為正": {"5": {"n": 5990, "win": 55.9, "ex": 0.17, "t": 2.11}, "10": {"n": 5992, "win": 62.6, "ex": 0.55, "t": 4.99}, "20": {"n": 5992, "win": 63.6, "ex": 1.1, "t": 6.73}},
-    "布林通道低檔(≤20%) ＋ 近3日向上跳空缺口 ＋ 三大法人近3月買超": {"5": {"n": 1056, "win": 59.8, "ex": 0.02, "t": 0.12}, "10": {"n": 1055, "win": 67.5, "ex": 1.18, "t": 4.84}, "20": {"n": 1056, "win": 71.6, "ex": 1.22, "t": 3.74}},
-    "布林通道低檔(≤20%) ＋ 相對強弱為負(弱於大盤) ＋ 近3日向上跳空缺口": {"5": {"n": 1967, "win": 58.1, "ex": -0.16, "t": -1.29}, "10": {"n": 1966, "win": 65.9, "ex": 0.73, "t": 4.58}, "20": {"n": 1967, "win": 71.0, "ex": 1.08, "t": 4.51}},
-    "布林通道低檔(≤20%) ＋ 近3日向上跳空缺口": {"5": {"n": 2255, "win": 58.6, "ex": -0.19, "t": -1.65}, "10": {"n": 2254, "win": 65.3, "ex": 0.63, "t": 4.21}, "20": {"n": 2255, "win": 70.3, "ex": 0.97, "t": 4.39}},
-    "多方力道≥80 ＋ 量能區間低檔(≤10百分位) ＋ 距52週高點≤5%": {"5": {"n": 228, "win": 58.3, "ex": 1.3, "t": 2.7}, "10": {"n": 228, "win": 61.4, "ex": 2.82, "t": 4.0}, "20": {"n": 228, "win": 61.0, "ex": 3.02, "t": 3.0}},
-    "布林通道低檔(≤20%) ＋ 近3日向上跳空缺口 ＋ 近3月均價YoY為正": {"5": {"n": 1395, "win": 56.2, "ex": -0.3, "t": -1.82}, "10": {"n": 1395, "win": 65.4, "ex": 0.8, "t": 4.0}, "20": {"n": 1395, "win": 72.1, "ex": 1.65, "t": 5.49}},
-    "布林通道低檔(≤20%) ＋ 地量(≤0.5倍均量) ＋ 近3日向上跳空缺口": {"5": {"n": 568, "win": 59.7, "ex": 0.11, "t": 0.39}, "10": {"n": 568, "win": 63.9, "ex": 1.22, "t": 3.8}, "20": {"n": 568, "win": 67.4, "ex": 1.15, "t": 2.55}},
-    "布林通道低檔(≤20%) ＋ KDJ近3日內黃金交叉 ＋ 近3日向上跳空缺口": {"5": {"n": 1479, "win": 57.2, "ex": -0.32, "t": -2.32}, "10": {"n": 1478, "win": 67.4, "ex": 0.62, "t": 3.75}, "20": {"n": 1479, "win": 72.3, "ex": 0.93, "t": 3.65}},
-    "近3日向上跳空缺口 ＋ 近3月乖離度為負(股價超前營收) ＋ 母子懷抱(低檔)剛形成": {"5": {"n": 266, "win": 53.4, "ex": 0.69, "t": 1.19}, "10": {"n": 266, "win": 60.9, "ex": 2.71, "t": 3.61}, "20": {"n": 266, "win": 64.3, "ex": 4.98, "t": 3.84}},
-    "量能區間低檔(≤10百分位) ＋ 大盤站上60日均線 ＋ 創52週新高": {"5": {"n": 72, "win": 59.7, "ex": 3.37, "t": 2.82}, "10": {"n": 72, "win": 63.9, "ex": 5.39, "t": 3.58}, "20": {"n": 72, "win": 68.1, "ex": 7.0, "t": 3.3}},
-    "布林通道低檔(≤20%) ＋ 近3日向上跳空缺口 ＋ 近3月乖離度為正(營收優於股價)": {"5": {"n": 1091, "win": 62.1, "ex": 0.04, "t": 0.26}, "10": {"n": 1091, "win": 66.9, "ex": 0.73, "t": 3.48}, "20": {"n": 1091, "win": 71.6, "ex": 0.87, "t": 2.96}},
-    "量能區間低檔(≤10百分位) ＋ 大盤跌破20日均線 ＋ 近3日向上跳空缺口": {"5": {"n": 1110, "win": 63.2, "ex": 0.18, "t": 1.14}, "10": {"n": 1110, "win": 63.2, "ex": 0.79, "t": 3.44}, "20": {"n": 1110, "win": 66.8, "ex": 1.08, "t": 3.25}},
-    "近3日向上跳空缺口 ＋ 母子懷抱(低檔)剛形成": {"5": {"n": 404, "win": 53.7, "ex": 0.37, "t": 0.83}, "10": {"n": 404, "win": 60.9, "ex": 1.89, "t": 3.02}, "20": {"n": 404, "win": 62.1, "ex": 3.22, "t": 3.22}},
-    "KDJ近3日內黃金交叉 ＋ 近3日向上跳空缺口 ＋ 母子懷抱(低檔)剛形成": {"5": {"n": 256, "win": 52.7, "ex": -0.13, "t": -0.24}, "10": {"n": 256, "win": 63.3, "ex": 2.04, "t": 2.95}, "20": {"n": 256, "win": 63.3, "ex": 3.01, "t": 2.57}},
-    "大盤跌破60日均線 ＋ 創52週新高 ＋ 圓弧底剛形成": {"5": {"n": 78, "win": 56.4, "ex": 3.27, "t": 2.63}, "10": {"n": 78, "win": 60.3, "ex": 5.33, "t": 2.81}, "20": {"n": 78, "win": 64.1, "ex": 6.01, "t": 2.85}},
-    "KDJ近3日內死亡交叉 ＋ 近3日向上跳空缺口 ＋ 母子懷抱(低檔)剛形成": {"5": {"n": 102, "win": 56.9, "ex": 1.97, "t": 2.06}, "10": {"n": 102, "win": 62.7, "ex": 3.64, "t": 2.79}, "20": {"n": 102, "win": 66.7, "ex": 5.23, "t": 2.75}},
-    "布林通道低檔(≤20%) ＋ 近3日向上跳空缺口 ＋ 近3月乖離度為負(股價超前營收)": {"5": {"n": 1119, "win": 55.2, "ex": -0.37, "t": -2.02}, "10": {"n": 1118, "win": 64.1, "ex": 0.57, "t": 2.69}, "20": {"n": 1119, "win": 69.6, "ex": 1.22, "t": 3.7}},
-    "地量(≤0.5倍均量) ＋ 近3日向上跳空缺口 ＋ 母子懷抱(低檔)剛形成": {"5": {"n": 89, "win": 48.3, "ex": 0.09, "t": 0.08}, "10": {"n": 89, "win": 70.8, "ex": 3.82, "t": 2.63}, "20": {"n": 89, "win": 60.7, "ex": 2.7, "t": 1.11}},
-    "近3日向上跳空缺口 ＋ 三大法人近3月賣超 ＋ 母子懷抱(低檔)剛形成": {"5": {"n": 195, "win": 55.4, "ex": -0.31, "t": -0.57}, "10": {"n": 195, "win": 65.1, "ex": 1.91, "t": 2.63}, "20": {"n": 195, "win": 64.1, "ex": 2.31, "t": 1.95}},
-    "大盤站上20日均線 ＋ 距52週高點≤5% ＋ 複式頭肩底剛形成": {"5": {"n": 120, "win": 60.0, "ex": 1.6, "t": 2.3}, "10": {"n": 120, "win": 62.5, "ex": 2.97, "t": 2.6}, "20": {"n": 120, "win": 52.5, "ex": 1.62, "t": 1.18}},
-    "距52週高點≤5% ＋ 近3月乖離度為正(營收優於股價) ＋ 複式頭肩底剛形成": {"5": {"n": 71, "win": 57.7, "ex": 0.99, "t": 1.28}, "10": {"n": 71, "win": 71.8, "ex": 2.74, "t": 2.58}, "20": {"n": 71, "win": 57.7, "ex": 1.99, "t": 1.54}},
-    "多方力道≥80 ＋ 創52週新高 ＋ 一字底(均線糾結)剛形成": {"5": {"n": 77, "win": 57.1, "ex": 1.08, "t": 2.0}, "10": {"n": 77, "win": 61.0, "ex": 2.3, "t": 2.5}, "20": {"n": 77, "win": 57.1, "ex": 0.73, "t": 0.49}},
-    "布林通道低檔(≤20%) ＋ 量能斜率轉弱(近5日均量<近10日均量20%以上) ＋ 近3日向上跳空缺口": {"5": {"n": 470, "win": 60.2, "ex": 0.05, "t": 0.19}, "10": {"n": 470, "win": 60.9, "ex": 0.86, "t": 2.42}, "20": {"n": 470, "win": 70.0, "ex": 2.26, "t": 4.6}},
-    "大盤站上20日均線 ＋ 近3日向上跳空缺口 ＋ 母子懷抱(低檔)剛形成": {"5": {"n": 218, "win": 55.0, "ex": 1.61, "t": 2.67}, "10": {"n": 218, "win": 60.6, "ex": 2.16, "t": 2.4}, "20": {"n": 218, "win": 64.7, "ex": 3.71, "t": 2.64}},
-    "距52週高點≤5% ＋ 複式頭肩底剛形成": {"5": {"n": 142, "win": 57.0, "ex": 1.09, "t": 1.71}, "10": {"n": 142, "win": 61.3, "ex": 2.44, "t": 2.38}, "20": {"n": 142, "win": 53.5, "ex": 1.39, "t": 1.15}},
-    "近3日向上跳空缺口 ＋ 近3月均價YoY為正 ＋ 母子懷抱(低檔)剛形成": {"5": {"n": 305, "win": 52.8, "ex": 0.31, "t": 0.59}, "10": {"n": 305, "win": 61.0, "ex": 1.7, "t": 2.33}, "20": {"n": 305, "win": 62.3, "ex": 3.16, "t": 2.71}},
-    "大盤站上60日均線 ＋ 距52週高點≤5% ＋ 複式頭肩底剛形成": {"5": {"n": 113, "win": 57.5, "ex": 1.03, "t": 1.46}, "10": {"n": 113, "win": 60.2, "ex": 2.68, "t": 2.32}, "20": {"n": 113, "win": 52.2, "ex": 1.68, "t": 1.19}},
-    "大盤跌破20日均線 ＋ 大盤跌破60日均線 ＋ 近3日向上跳空缺口": {"5": {"n": 6799, "win": 57.3, "ex": -0.02, "t": -0.29}, "10": {"n": 6798, "win": 62.6, "ex": 0.22, "t": 2.28}, "20": {"n": 6800, "win": 64.2, "ex": 0.59, "t": 4.26}},
-    "相對強弱為負(弱於大盤) ＋ 距52週高點≤5% ＋ 突破飆股大量黑K最高點剛形成": {"5": {"n": 134, "win": 55.2, "ex": 1.71, "t": 2.66}, "10": {"n": 134, "win": 60.4, "ex": 1.66, "t": 2.27}, "20": {"n": 134, "win": 59.7, "ex": 2.5, "t": 2.2}},
-    "KDJ近3日內黃金交叉 ＋ 大盤跌破60日均線 ＋ 近3日向上跳空缺口": {"5": {"n": 5788, "win": 54.9, "ex": -0.02, "t": -0.3}, "10": {"n": 5789, "win": 60.3, "ex": 0.24, "t": 2.2}, "20": {"n": 5790, "win": 62.6, "ex": 0.46, "t": 2.97}},
-    "距52週高點≤5% ＋ 複式頭肩底剛形成 ＋ 三重底剛形成": {"5": {"n": 51, "win": 66.7, "ex": 1.2, "t": 0.93}, "10": {"n": 51, "win": 66.7, "ex": 4.87, "t": 2.16}, "20": {"n": 51, "win": 60.8, "ex": 3.28, "t": 1.22}},
-    "距52週高點≤5% ＋ 三大法人近3月買超 ＋ 複式頭肩底剛形成": {"5": {"n": 128, "win": 55.5, "ex": 0.94, "t": 1.38}, "10": {"n": 128, "win": 60.2, "ex": 2.25, "t": 2.06}, "20": {"n": 128, "win": 53.1, "ex": 1.6, "t": 1.23}},
-    "近3日向上跳空缺口 ＋ 近3月均價YoY為負 ＋ 母子懷抱(低檔)剛形成": {"5": {"n": 99, "win": 56.6, "ex": 0.57, "t": 0.65}, "10": {"n": 99, "win": 60.6, "ex": 2.48, "t": 2.04}, "20": {"n": 99, "win": 61.6, "ex": 3.39, "t": 1.76}},
-    "強勢突破盤 ＋ 地量(≤0.5倍均量) ＋ 創52週新高": {"5": {"n": 258, "win": 58.5, "ex": 3.78, "t": 4.87}, "10": {"n": 258, "win": 59.3, "ex": 6.16, "t": 5.34}, "20": {"n": 257, "win": 63.8, "ex": 10.08, "t": 6.04}},
-    "強勢突破盤 ＋ 地量(≤0.5倍均量) ＋ 近3日向上跳空缺口": {"5": {"n": 276, "win": 55.8, "ex": 3.47, "t": 4.48}, "10": {"n": 276, "win": 59.4, "ex": 6.26, "t": 5.44}, "20": {"n": 275, "win": 60.7, "ex": 9.76, "t": 5.84}},
-    "KDJ近3日內黃金交叉 ＋ 大盤跌破20日均線 ＋ 近3日向上跳空缺口": {"5": {"n": 7175, "win": 51.2, "ex": -0.27, "t": -3.43}, "10": {"n": 7175, "win": 56.5, "ex": 0.42, "t": 3.86}, "20": {"n": 7175, "win": 60.2, "ex": 0.88, "t": 5.47}},
-    "大盤跌破60日均線 ＋ 近3日向上跳空缺口": {"5": {"n": 10776, "win": 54.7, "ex": 0.0, "t": 0.08}, "10": {"n": 10777, "win": 59.6, "ex": 0.17, "t": 2.15}, "20": {"n": 10779, "win": 60.3, "ex": 0.51, "t": 4.33}},
-    "量能斜率轉弱(近5日均量<近10日均量20%以上) ＋ 大盤跌破20日均線 ＋ 近3日向上跳空缺口": {"5": {"n": 2478, "win": 57.9, "ex": 0.01, "t": 0.1}, "10": {"n": 2480, "win": 58.0, "ex": 0.52, "t": 2.85}, "20": {"n": 2480, "win": 62.0, "ex": 1.16, "t": 4.06}},
-    "創52週新高 ＋ 近3日向上跳空缺口 ＋ 三重底剛形成": {"5": {"n": 255, "win": 53.7, "ex": 1.5, "t": 2.75}, "10": {"n": 255, "win": 54.9, "ex": 2.41, "t": 3.33}, "20": {"n": 255, "win": 60.8, "ex": 3.53, "t": 3.46}},
-    "量能區間低檔(≤10百分位) ＋ 近3日向上跳空缺口 ＋ 近3月均價YoY為正": {"5": {"n": 1502, "win": 56.3, "ex": 0.3, "t": 2.05}, "10": {"n": 1502, "win": 58.5, "ex": 0.83, "t": 3.95}, "20": {"n": 1502, "win": 61.9, "ex": 1.04, "t": 3.4}},
-    "量能區間低檔(≤10百分位) ＋ 近3日向上跳空缺口 ＋ 近3月乖離度為負(股價超前營收)": {"5": {"n": 1348, "win": 54.8, "ex": 0.3, "t": 1.95}, "10": {"n": 1348, "win": 58.1, "ex": 0.71, "t": 3.22}, "20": {"n": 1348, "win": 61.0, "ex": 1.05, "t": 3.27}},
-    "大盤跌破60日均線 ＋ 近3日向上跳空缺口 ＋ 近3月乖離度為負(股價超前營收)": {"5": {"n": 4631, "win": 54.1, "ex": -0.02, "t": -0.22}, "10": {"n": 4630, "win": 59.9, "ex": 0.12, "t": 0.99}, "20": {"n": 4630, "win": 61.7, "ex": 0.57, "t": 3.13}},
-    "相對強弱為負(弱於大盤) ＋ 創52週新高 ＋ 圓弧底剛形成": {"5": {"n": 80, "win": 51.2, "ex": 0.82, "t": 1.19}, "10": {"n": 80, "win": 50.0, "ex": 0.98, "t": 1.17}, "20": {"n": 79, "win": 60.8, "ex": 3.87, "t": 3.08}},
-    "KDJ近3日內死亡交叉 ＋ 創52週新高 ＋ 圓弧底剛形成": {"5": {"n": 105, "win": 43.8, "ex": 0.84, "t": 1.12}, "10": {"n": 105, "win": 50.5, "ex": 2.13, "t": 1.91}, "20": {"n": 105, "win": 62.9, "ex": 4.93, "t": 3.06}},
-    "相對強弱為負(弱於大盤) ＋ 大盤跌破60日均線": {"5": {"n": 51892, "win": 56.9, "ex": 0.09, "t": 4.24}, "10": {"n": 51889, "win": 58.8, "ex": 0.07, "t": 2.1}, "20": {"n": 51896, "win": 60.2, "ex": 0.14, "t": 3.02}},
-    "距52週高點≤5% ＋ 三重底剛形成 ＋ 圓弧底剛形成": {"5": {"n": 172, "win": 52.3, "ex": 1.39, "t": 2.7}, "10": {"n": 172, "win": 57.6, "ex": 1.88, "t": 2.33}, "20": {"n": 172, "win": 61.0, "ex": 4.06, "t": 2.92}},
-    "強勢突破盤 ＋ 量能區間低檔(≤10百分位) ＋ 距52週高點≤5%": {"5": {"n": 91, "win": 49.5, "ex": 0.71, "t": 0.73}, "10": {"n": 91, "win": 56.0, "ex": 2.14, "t": 1.82}, "20": {"n": 90, "win": 65.6, "ex": 4.82, "t": 2.84}},
-    "地量(≤0.5倍均量) ＋ 大盤跌破20日均線 ＋ 近3日向上跳空缺口": {"5": {"n": 2261, "win": 58.1, "ex": 0.09, "t": 0.64}, "10": {"n": 2261, "win": 59.3, "ex": 0.75, "t": 3.9}, "20": {"n": 2261, "win": 60.9, "ex": 0.79, "t": 2.71}},
-    "創52週新高 ＋ 三重底剛形成 ＋ 圓弧底剛形成": {"5": {"n": 82, "win": 56.1, "ex": 2.27, "t": 2.92}, "10": {"n": 82, "win": 63.4, "ex": 2.46, "t": 1.92}, "20": {"n": 82, "win": 69.5, "ex": 5.32, "t": 2.63}},
-    "大盤站上60日均線 ＋ 近3日向上跳空缺口 ＋ 母子懷抱(低檔)剛形成": {"5": {"n": 326, "win": 49.4, "ex": 0.12, "t": 0.23}, "10": {"n": 326, "win": 57.1, "ex": 1.86, "t": 2.5}, "20": {"n": 326, "win": 60.4, "ex": 3.11, "t": 2.61}},
-    "近3日向上跳空缺口 ＋ 三大法人近3月買超 ＋ 母子懷抱(低檔)剛形成": {"5": {"n": 209, "win": 52.2, "ex": 1.01, "t": 1.45}, "10": {"n": 209, "win": 56.9, "ex": 1.87, "t": 1.87}, "20": {"n": 209, "win": 60.3, "ex": 4.07, "t": 2.57}},
-    "布林通道低檔(≤20%) ＋ 近3日向上跳空缺口 ＋ 三大法人近3月賣超": {"5": {"n": 1197, "win": 57.4, "ex": -0.39, "t": -2.67}, "10": {"n": 1197, "win": 63.2, "ex": 0.14, "t": 0.78}, "20": {"n": 1197, "win": 69.1, "ex": 0.75, "t": 2.49}},
-    "量能區間低檔(≤10百分位) ＋ 近3日向上跳空缺口 ＋ 三大法人近3月買超": {"5": {"n": 1043, "win": 58.2, "ex": 0.56, "t": 3.12}, "10": {"n": 1043, "win": 57.8, "ex": 1.04, "t": 3.94}, "20": {"n": 1043, "win": 60.2, "ex": 0.92, "t": 2.49}},
-    "創52週新高 ＋ 圓弧底剛形成 ＋ 突破ABC修正下降切線剛形成": {"5": {"n": 50, "win": 52.0, "ex": 1.3, "t": 1.23}, "10": {"n": 50, "win": 58.0, "ex": 2.95, "t": 1.73}, "20": {"n": 50, "win": 62.0, "ex": 5.48, "t": 2.39}},
-    "創52週新高 ＋ 圓弧底剛形成 ＋ 一字底(均線糾結)剛形成": {"5": {"n": 57, "win": 56.1, "ex": 1.38, "t": 2.17}, "10": {"n": 57, "win": 57.9, "ex": 0.76, "t": 1.08}, "20": {"n": 57, "win": 64.9, "ex": 3.38, "t": 2.31}},
-    "距52週高點≤5% ＋ N字底剛形成 ＋ 一字底(均線糾結)剛形成": {"5": {"n": 96, "win": 57.3, "ex": 0.51, "t": 1.05}, "10": {"n": 96, "win": 60.4, "ex": 0.81, "t": 1.33}, "20": {"n": 96, "win": 68.8, "ex": 1.99, "t": 2.15}},
-    "相對強弱為負(弱於大盤) ＋ 創52週新高 ＋ N字底剛形成": {"5": {"n": 55, "win": 52.7, "ex": 0.47, "t": 0.74}, "10": {"n": 55, "win": 63.6, "ex": 0.94, "t": 1.17}, "20": {"n": 55, "win": 65.5, "ex": 3.33, "t": 2.14}},
-    "相對強弱為負(弱於大盤) ＋ 近3日向上跳空缺口 ＋ 母子懷抱(低檔)剛形成": {"5": {"n": 237, "win": 54.0, "ex": -0.95, "t": -2.06}, "10": {"n": 237, "win": 62.9, "ex": 0.86, "t": 1.25}, "20": {"n": 237, "win": 65.8, "ex": 2.42, "t": 2.14}},
-    "KDJ近3日內死亡交叉 ＋ 量能斜率轉弱(近5日均量<近10日均量20%以上) ＋ 近3日向上跳空缺口": {"5": {"n": 869, "win": 56.6, "ex": 0.11, "t": 0.4}, "10": {"n": 869, "win": 59.5, "ex": 1.02, "t": 2.52}, "20": {"n": 869, "win": 60.1, "ex": 1.3, "t": 2.13}},
-    "大盤跌破20日均線 ＋ 近3日向上跳空缺口 ＋ 夜星剛形成": {"5": {"n": 51, "win": 47.1, "ex": -1.81, "t": -1.44}, "10": {"n": 51, "win": 49.0, "ex": 1.09, "t": 0.61}, "20": {"n": 51, "win": 60.8, "ex": 7.86, "t": 2.1}},
+    "相對強弱為負(弱於大盤) ＋ 大盤跌破20日均線 ＋ 近3月均價YoY為正": {"5": {"n": 44003, "win": 52.6, "ex": 0.2, "t": 7.5}, "10": {"n": 44003, "win": 54.4, "ex": 0.41, "t": 11.25}, "20": {"n": 44003, "win": 57.4, "ex": 0.84, "t": 14.91}},
+    "相對強弱為正(強於大盤) ＋ 地量(≤0.5倍均量) ＋ 距52週高點≤5%": {"5": {"n": 2945, "win": 52.6, "ex": 1.15, "t": 7.54}, "10": {"n": 2945, "win": 53.1, "ex": 1.93, "t": 8.68}, "20": {"n": 2945, "win": 55.2, "ex": 3.01, "t": 9.16}},
+    "相對強弱為負(弱於大盤) ＋ 大盤跌破20日均線 ＋ 外資近5日買超": {"5": {"n": 29037, "win": 53.7, "ex": 0.23, "t": 7.02}, "10": {"n": 29037, "win": 55.5, "ex": 0.4, "t": 8.7}, "20": {"n": 29037, "win": 58.4, "ex": 0.6, "t": 8.76}},
+    "KDJ近3日內死亡交叉 ＋ 相對強弱為負(弱於大盤) ＋ 大盤跌破20日均線": {"5": {"n": 22630, "win": 55.7, "ex": 0.28, "t": 7.92}, "10": {"n": 22630, "win": 53.3, "ex": 0.31, "t": 6.34}, "20": {"n": 22630, "win": 57.2, "ex": 0.37, "t": 5.05}},
+    "相對強弱為負(弱於大盤) ＋ 大盤跌破20日均線 ＋ 三大法人近3月買超": {"5": {"n": 30239, "win": 53.5, "ex": 0.27, "t": 8.39}, "10": {"n": 30239, "win": 54.9, "ex": 0.53, "t": 11.58}, "20": {"n": 30239, "win": 57.3, "ex": 0.54, "t": 7.86}},
+    "相對強弱為負(弱於大盤) ＋ 大盤跌破60日均線 ＋ 外資近5日買超": {"5": {"n": 24430, "win": 57.5, "ex": 0.19, "t": 5.47}, "10": {"n": 24430, "win": 60.3, "ex": 0.21, "t": 4.36}, "20": {"n": 24430, "win": 61.1, "ex": 0.56, "t": 7.65}},
+    "相對強弱為負(弱於大盤) ＋ 大盤跌破20日均線 ＋ 近3日向上跳空缺口": {"5": {"n": 5695, "win": 54.5, "ex": -0.11, "t": -1.47}, "10": {"n": 5695, "win": 66.9, "ex": 0.69, "t": 6.95}, "20": {"n": 5695, "win": 70.4, "ex": 0.95, "t": 6.43}},
+    "布林通道低檔(≤20%) ＋ 大盤跌破20日均線 ＋ 近3日向上跳空缺口": {"5": {"n": 1907, "win": 62.8, "ex": -0.01, "t": -0.04}, "10": {"n": 1907, "win": 73.2, "ex": 1.09, "t": 6.62}, "20": {"n": 1907, "win": 77.9, "ex": 1.58, "t": 6.87}},
+    "強勢突破盤 ＋ 地量(≤0.5倍均量) ＋ DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR)": {"5": {"n": 360, "win": 54.4, "ex": 2.89, "t": 4.53}, "10": {"n": 360, "win": 56.9, "ex": 4.83, "t": 5.17}, "20": {"n": 360, "win": 57.2, "ex": 8.97, "t": 6.36}},
+    "強勢突破盤 ＋ 地量(≤0.5倍均量) ＋ 創52週新高": {"5": {"n": 263, "win": 59.3, "ex": 4.07, "t": 5.18}, "10": {"n": 263, "win": 59.7, "ex": 6.34, "t": 5.54}, "20": {"n": 263, "win": 64.6, "ex": 10.52, "t": 6.32}},
+    "量能區間低檔(≤10百分位) ＋ 距52週高點≤5% ＋ 均線多頭排列(5>20>60且站上月線)": {"5": {"n": 706, "win": 56.2, "ex": 1.27, "t": 5.54}, "10": {"n": 706, "win": 57.6, "ex": 2.08, "t": 6.29}, "20": {"n": 706, "win": 58.1, "ex": 2.66, "t": 5.91}},
+    "強勢突破盤 ＋ 地量(≤0.5倍均量) ＋ 均線多頭排列(5>20>60且站上月線)": {"5": {"n": 581, "win": 51.3, "ex": 2.14, "t": 4.73}, "10": {"n": 581, "win": 53.4, "ex": 3.67, "t": 5.46}, "20": {"n": 581, "win": 55.9, "ex": 6.04, "t": 6.22}},
+    "強勢突破盤 ＋ 地量(≤0.5倍均量) ＋ 近3日向上跳空缺口": {"5": {"n": 277, "win": 58.1, "ex": 4.02, "t": 5.08}, "10": {"n": 277, "win": 60.3, "ex": 6.59, "t": 5.73}, "20": {"n": 277, "win": 61.7, "ex": 10.33, "t": 6.17}},
+    "相對強弱為負(弱於大盤) ＋ 大盤跌破20日均線 ＋ 投信連續買超≥3日": {"5": {"n": 5379, "win": 53.9, "ex": 0.29, "t": 4.12}, "10": {"n": 5379, "win": 57.0, "ex": 0.73, "t": 7.41}, "20": {"n": 5379, "win": 59.5, "ex": 0.84, "t": 6.02}},
+    "量能區間低檔(≤10百分位) ＋ 距52週高點≤5% ＋ 近3月均價YoY為正": {"5": {"n": 976, "win": 53.3, "ex": 0.92, "t": 5.35}, "10": {"n": 976, "win": 54.0, "ex": 1.61, "t": 6.38}, "20": {"n": 976, "win": 55.6, "ex": 2.04, "t": 5.94}},
+    "量能區間低檔(≤10百分位) ＋ 距52週高點≤5% ＋ 三大法人近3月買超": {"5": {"n": 849, "win": 53.5, "ex": 0.89, "t": 4.79}, "10": {"n": 849, "win": 55.1, "ex": 1.59, "t": 5.86}, "20": {"n": 849, "win": 55.1, "ex": 2.08, "t": 5.49}},
+    "地量(≤0.5倍均量) ＋ 近3日向上跳空缺口 ＋ 外資近5日買超": {"5": {"n": 3175, "win": 53.5, "ex": 0.57, "t": 4.18}, "10": {"n": 3175, "win": 54.4, "ex": 1.05, "t": 5.35}, "20": {"n": 3175, "win": 56.6, "ex": 1.77, "t": 5.81}},
+    "量能區間低檔(≤10百分位) ＋ 距52週高點≤5% ＋ 外資近5日買超": {"5": {"n": 628, "win": 54.5, "ex": 0.89, "t": 3.98}, "10": {"n": 628, "win": 57.5, "ex": 1.82, "t": 5.77}, "20": {"n": 628, "win": 57.5, "ex": 2.11, "t": 4.92}},
+    "相對強弱為負(弱於大盤) ＋ 大盤跌破20日均線": {"5": {"n": 72554, "win": 52.8, "ex": 0.08, "t": 3.91}, "10": {"n": 72554, "win": 53.9, "ex": 0.21, "t": 7.54}, "20": {"n": 72554, "win": 56.7, "ex": 0.2, "t": 4.92}},
+    "多方力道≥65 ＋ 量能區間低檔(≤10百分位) ＋ 距52週高點≤5%": {"5": {"n": 437, "win": 54.5, "ex": 1.15, "t": 3.72}, "10": {"n": 437, "win": 56.8, "ex": 2.08, "t": 4.7}, "20": {"n": 437, "win": 58.1, "ex": 2.34, "t": 3.83}},
+    "量能區間低檔(≤10百分位) ＋ 距52週高點≤5% ＋ 土洋同買(外資、投信近5日皆買超)": {"5": {"n": 277, "win": 56.3, "ex": 1.53, "t": 4.6}, "10": {"n": 277, "win": 60.6, "ex": 2.25, "t": 4.67}, "20": {"n": 277, "win": 56.7, "ex": 2.7, "t": 4.0}},
+    "大盤跌破20日均線 ＋ 近3日向上跳空缺口 ＋ 近3月乖離度為正(營收優於股價)": {"5": {"n": 6918, "win": 53.0, "ex": 0.1, "t": 1.22}, "10": {"n": 6918, "win": 56.6, "ex": 0.48, "t": 4.42}, "20": {"n": 6918, "win": 59.2, "ex": 0.57, "t": 3.69}},
+    "多方力道≥65 ＋ 土洋同買(外資、投信近5日皆買超) ＋ N字底剛形成": {"5": {"n": 423, "win": 48.9, "ex": 1.1, "t": 2.74}, "10": {"n": 423, "win": 56.7, "ex": 2.57, "t": 4.33}, "20": {"n": 423, "win": 52.0, "ex": 2.53, "t": 3.0}},
+    "土洋同買(外資、投信近5日皆買超) ＋ DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR) ＋ N字底剛形成": {"5": {"n": 306, "win": 51.3, "ex": 1.58, "t": 3.17}, "10": {"n": 306, "win": 57.8, "ex": 3.05, "t": 4.26}, "20": {"n": 306, "win": 51.3, "ex": 2.6, "t": 2.52}},
+    "創52週新高 ＋ 近3月乖離度為正(營收優於股價) ＋ 圓弧底剛形成": {"5": {"n": 282, "win": 53.9, "ex": 1.85, "t": 3.36}, "10": {"n": 282, "win": 54.6, "ex": 3.24, "t": 3.98}, "20": {"n": 282, "win": 55.7, "ex": 4.82, "t": 4.2}},
+    "近3月乖離度為正(營收優於股價) ＋ 近3月均價YoY為正 ＋ N字底剛形成": {"5": {"n": 722, "win": 50.3, "ex": 0.37, "t": 1.34}, "10": {"n": 722, "win": 53.9, "ex": 1.18, "t": 2.91}, "20": {"n": 722, "win": 56.0, "ex": 2.49, "t": 4.16}},
+    "相對強弱為負(弱於大盤) ＋ 大盤跌破20日均線 ＋ 連續放量(近3日均量≥1.5倍前20日均量)": {"5": {"n": 7342, "win": 55.6, "ex": 0.11, "t": 1.56}, "10": {"n": 7342, "win": 57.9, "ex": 0.37, "t": 4.13}, "20": {"n": 7342, "win": 60.8, "ex": 0.26, "t": 2.14}},
+    "近3日向上跳空缺口 ＋ 近3月乖離度為負(股價超前營收) ＋ 母子懷抱(低檔)剛形成": {"5": {"n": 257, "win": 53.3, "ex": 0.85, "t": 1.44}, "10": {"n": 257, "win": 61.9, "ex": 2.98, "t": 3.88}, "20": {"n": 257, "win": 65.0, "ex": 5.43, "t": 4.07}},
+    "地量(≤0.5倍均量) ＋ 量能斜率轉強(近5日均量>近10日均量20%以上) ＋ 創52週新高": {"5": {"n": 69, "win": 72.5, "ex": 6.71, "t": 3.97}, "10": {"n": 69, "win": 66.7, "ex": 9.04, "t": 4.05}, "20": {"n": 69, "win": 60.9, "ex": 9.59, "t": 3.39}},
+    "量能區間低檔(≤10百分位) ＋ 近3日向上跳空缺口 ＋ 近3月均價YoY為正": {"5": {"n": 1469, "win": 56.2, "ex": 0.36, "t": 2.46}, "10": {"n": 1469, "win": 58.5, "ex": 0.94, "t": 4.45}, "20": {"n": 1469, "win": 61.7, "ex": 1.25, "t": 4.0}},
+    "地量(≤0.5倍均量) ＋ 創52週新高 ＋ 三大法人近3月賣超": {"5": {"n": 60, "win": 63.3, "ex": 5.97, "t": 3.42}, "10": {"n": 60, "win": 58.3, "ex": 9.24, "t": 3.41}, "20": {"n": 60, "win": 73.3, "ex": 14.07, "t": 3.97}},
+
 }
 BT_HOT_COMBOS = [
     ["地量(≤0.5倍均量)", "創52週新高", "三大法人近3月賣超"],
-    ["強勢突破盤", "地量(≤0.5倍均量)", "創52週新高"],
     ["量能斜率轉弱(近5日均量<近10日均量20%以上)", "距52週高點≤5%", "晨星剛形成"],
-    ["地量(≤0.5倍均量)", "回後買上漲全通過", "創52週新高"],
-    ["強勢突破盤", "地量(≤0.5倍均量)", "近3日向上跳空缺口"],
-    ["多方力道≥65", "量能區間低檔(≤10百分位)", "創52週新高"],
-    ["量能斜率轉弱(近5日均量<近10日均量20%以上)", "創52週新高", "近3日向上跳空缺口"],
-    ["地量(≤0.5倍均量)", "回後買上漲全通過", "近3日向上跳空缺口"],
-    ["多方力道≥65", "近3日向上跳空缺口", "母子懷抱(低檔)剛形成"],
-    ["地量(≤0.5倍均量)", "回後買上漲全通過", "距52週高點≤5%"],
-    ["多方力道≥80", "地量(≤0.5倍均量)", "創52週新高"],
-    ["地量(≤0.5倍均量)", "創52週新高", "近3月乖離度為負(股價超前營收)"],
-    ["地量(≤0.5倍均量)", "創52週新高", "近3月均價YoY為負"],
-    ["創52週新高", "近3月乖離度為負(股價超前營收)", "晨星剛形成"],
-    ["量能區間低檔(≤10百分位)", "創52週新高", "近3月乖離度為負(股價超前營收)"],
-    ["地量(≤0.5倍均量)", "均線多頭排列(5>20>60且站上月線)", "夜星剛形成"],
-    ["多方力道≥80", "地量(≤0.5倍均量)", "近3日向上跳空缺口"],
-    ["KDJ近3日內死亡交叉", "地量(≤0.5倍均量)", "創52週新高"],
-    ["距52週高點≤5%", "突破飆股大量黑K最高點剛形成", "晨星剛形成"],
-    ["地量(≤0.5倍均量)", "回後買上漲全通過", "均線多頭排列(5>20>60且站上月線)"],
-    ["距52週高點≤5%", "K線橫盤的突破剛形成", "晨星剛形成"],
-    ["地量(≤0.5倍均量)", "量能斜率轉弱(近5日均量<近10日均量20%以上)", "創52週新高"],
-    ["地量(≤0.5倍均量)", "大盤跌破20日均線", "創52週新高"],
-    ["地量(≤0.5倍均量)", "大盤站上60日均線", "創52週新高"],
-    ["創52週新高", "近3月均價YoY為正", "母子懷抱(低檔)剛形成"],
-    ["相對強弱為正(強於大盤)", "地量(≤0.5倍均量)", "創52週新高"],
-    ["地量(≤0.5倍均量)", "距52週高點≤5%", "近3日向上跳空缺口"],
-    ["量能區間低檔(≤10百分位)", "距52週高點≤5%", "近3日向上跳空缺口"],
-    ["地量(≤0.5倍均量)", "均線多頭排列(5>20>60且站上月線)", "晨星剛形成"],
-    ["創52週新高", "近3月均價YoY為正", "晨星剛形成"],
-    ["布林通道高檔(≥80%)", "地量(≤0.5倍均量)", "創52週新高"],
-    ["均線多頭排列(5>20>60且站上月線)", "突破飆股大量黑K最高點剛形成", "晨星剛形成"],
-    ["均線多頭排列(5>20>60且站上月線)", "K線橫盤的突破剛形成", "晨星剛形成"],
-    ["爆量(≥1.5倍均量)", "量能斜率轉弱(近5日均量<近10日均量20%以上)", "創52週新高"],
+    ["創52週新高", "DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR)", "母子懷抱(低檔)剛形成"],
+    ["均線多頭排列(5>20>60且站上月線)", "K線橫盤的突破剛形成", "母子懷抱(低檔)剛形成"],
     ["大盤站上60日均線", "創52週新高", "母子懷抱(低檔)剛形成"],
-    ["多方力道≥65", "地量(≤0.5倍均量)", "創52週新高"],
-    ["創52週新高", "三大法人近3月買超", "母子懷抱(低檔)剛形成"],
-    ["地量(≤0.5倍均量)", "創52週新高"],
-    ["多方力道≥65", "創52週新高", "母子懷抱(低檔)剛形成"],
-    ["KDJ近3日內黃金交叉", "地量(≤0.5倍均量)", "創52週新高"],
-    ["爆量(≥2倍均量)", "量能斜率轉弱(近5日均量<近10日均量20%以上)", "創52週新高"],
-    ["地量(≤0.5倍均量)", "創52週新高", "均線多頭排列(5>20>60且站上月線)"],
-    ["量能斜率轉弱(近5日均量<近10日均量20%以上)", "創52週新高", "近3月均價YoY為負"],
-    ["布林通道高檔(≥80%)", "量能區間低檔(≤10百分位)", "創52週新高"],
-    ["相對強弱為正(強於大盤)", "創52週新高", "母子懷抱(低檔)剛形成"],
-    ["地量(≤0.5倍均量)", "大盤站上20日均線", "創52週新高"],
-    ["量能區間低檔(≤10百分位)", "大盤站上60日均線", "創52週新高"],
-    ["均線多頭排列(5>20>60且站上月線)", "突破飆股大量黑K最高點剛形成", "母子懷抱(低檔)剛形成"],
-    ["多方力道≥80", "創52週新高", "晨星剛形成"],
-    ["地量(≤0.5倍均量)", "創52週新高", "近3月均價YoY為正"],
-    ["量能斜率轉弱(近5日均量<近10日均量20%以上)", "均線多頭排列(5>20>60且站上月線)", "晨星剛形成"],
-    ["布林通道高檔(≥80%)", "地量(≤0.5倍均量)", "近3日向上跳空缺口"],
-    ["布林通道高檔(≥80%)", "創52週新高", "母子懷抱(低檔)剛形成"],
-    ["地量(≤0.5倍均量)", "創52週新高", "距52週高點≤5%"],
-    ["大盤站上60日均線", "創52週新高", "晨星剛形成"],
-    ["創52週新高", "母子懷抱(低檔)剛形成"],
-    ["布林通道高檔(≥80%)", "近3日向上跳空缺口", "母子懷抱(低檔)剛形成"],
-    ["相對強弱為正(強於大盤)", "量能區間低檔(≤10百分位)", "創52週新高"],
-    ["大盤站上60日均線", "距52週高點≤5%", "晨星剛形成"],
-    ["距52週高點≤5%", "近3月乖離度為負(股價超前營收)", "晨星剛形成"],
-    ["距52週高點≤5%", "近3月均價YoY為正", "晨星剛形成"],
-    ["多方力道≥80", "均線多頭排列(5>20>60且站上月線)", "晨星剛形成"],
-    ["地量(≤0.5倍均量)", "量能斜率轉強(近5日均量>近10日均量20%以上)", "創52週新高"],
-    ["地量(≤0.5倍均量)", "創52週新高", "三大法人近3月買超"],
-    ["創52週新高", "突破飆股大量黑K最高點剛形成", "晨星剛形成"],
-    ["多方力道≥80", "距52週高點≤5%", "晨星剛形成"],
-    ["強勢突破盤", "地量(≤0.5倍均量)", "距52週高點≤5%"],
-    ["量能區間低檔(≤10百分位)", "創52週新高"],
-    ["多方力道≥80", "量能斜率轉弱(近5日均量<近10日均量20%以上)", "近3日向上跳空缺口"],
-    ["大盤站上20日均線", "創52週新高", "晨星剛形成"],
-    ["創52週新高", "近3日向上跳空缺口", "N字底剛形成"],
-    ["相對強弱為正(強於大盤)", "創52週新高", "晨星剛形成"],
-    ["爆量(≥2倍均量)", "創52週新高", "晨星剛形成"],
-    ["回後買上漲全通過", "創52週新高", "近3日向上跳空缺口"],
-    ["相對強弱為正(強於大盤)", "距52週高點≤5%", "晨星剛形成"],
-    ["量能區間低檔(≤10百分位)", "創52週新高", "距52週高點≤5%"],
-    ["大盤站上20日均線", "距52週高點≤5%", "晨星剛形成"],
-    ["大盤跌破20日均線", "均線多頭排列(5>20>60且站上月線)", "夜星剛形成"],
-    ["地量(≤0.5倍均量)", "均線多頭排列(5>20>60且站上月線)", "近3日向上跳空缺口"],
-    ["量能斜率轉強(近5日均量>近10日均量20%以上)", "距52週高點≤5%", "晨星剛形成"],
-    ["量能斜率轉弱(近5日均量<近10日均量20%以上)", "回後買上漲全通過", "創52週新高"],
+    ["量能斜率轉弱(近5日均量<近10日均量20%以上)", "DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR)", "晨星剛形成"],
+    ["多方力道≥65", "量能區間低檔(≤10百分位)", "創52週新高"],
     ["大盤站上20日均線", "創52週新高", "母子懷抱(低檔)剛形成"],
-    ["距52週高點≤5%", "三大法人近3月買超", "晨星剛形成"],
-    ["KDJ近3日內黃金交叉", "創52週新高", "晨星剛形成"],
-    ["量能區間低檔(≤10百分位)", "創52週新高", "三大法人近3月買超"],
-    ["創52週新高", "均線多頭排列(5>20>60且站上月線)", "晨星剛形成"],
-    ["距52週高點≤5%", "均線多頭排列(5>20>60且站上月線)", "晨星剛形成"],
-    ["創52週新高", "晨星剛形成"],
-    ["布林通道高檔(≥80%)", "距52週高點≤5%", "晨星剛形成"],
-    ["量能斜率轉弱(近5日均量<近10日均量20%以上)", "回後買上漲全通過", "近3日向上跳空缺口"],
-    ["多方力道≥65", "創52週新高", "晨星剛形成"],
-    ["創52週新高", "三大法人近3月賣超", "突破飆股大量黑K最高點剛形成"],
-    ["均線多頭排列(5>20>60且站上月線)", "近3月乖離度為負(股價超前營收)", "晨星剛形成"],
-    ["距52週高點≤5%", "晨星剛形成"],
-    ["多方力道≥80", "量能斜率轉弱(近5日均量<近10日均量20%以上)", "創52週新高"],
-    ["強勢突破盤", "量能斜率轉弱(近5日均量<近10日均量20%以上)", "創52週新高"],
-    ["相對強弱為正(強於大盤)", "近3日向上跳空缺口", "母子懷抱(低檔)剛形成"],
-    ["創52週新高", "N字底剛形成", "突破飆股大量黑K最高點剛形成"],
-    ["均線多頭排列(5>20>60且站上月線)", "近3日向上跳空缺口", "母子懷抱(低檔)剛形成"],
-    ["爆量(≥2倍均量)", "距52週高點≤5%", "晨星剛形成"],
-    ["量能斜率轉弱(近5日均量<近10日均量20%以上)", "創52週新高", "三大法人近3月賣超"],
-    ["創52週新高", "近3月均價YoY為負", "N字底剛形成"],
-    ["創52週新高", "三大法人近3月買超", "晨星剛形成"],
-    ["強勢突破盤", "地量(≤0.5倍均量)", "均線多頭排列(5>20>60且站上月線)"],
-    ["創52週新高", "距52週高點≤5%", "晨星剛形成"],
-    ["多方力道≥80", "創52週新高", "近3日向上跳空缺口"],
-    ["強勢突破盤", "量能斜率轉弱(近5日均量<近10日均量20%以上)", "近3日向上跳空缺口"],
-    ["創52週新高", "三大法人近3月賣超", "N字底剛形成"],
-    ["均線多頭排列(5>20>60且站上月線)", "近3月均價YoY為正", "晨星剛形成"],
-    ["多方力道≥65", "創52週新高", "近3日向上跳空缺口"],
-    ["相對強弱為正(強於大盤)", "均線多頭排列(5>20>60且站上月線)", "晨星剛形成"],
-    ["大盤站上20日均線", "均線多頭排列(5>20>60且站上月線)", "晨星剛形成"],
-    ["量能斜率轉弱(近5日均量<近10日均量20%以上)", "距52週高點≤5%", "近3日向上跳空缺口"],
-    ["創52週新高", "近3日向上跳空缺口", "近3月均價YoY為負"],
-    ["大盤站上60日均線", "創52週新高", "近3日向上跳空缺口"],
-    ["均線多頭排列(5>20>60且站上月線)", "N字底剛形成", "突破飆股大量黑K最高點剛形成"],
-    ["多方力道≥80", "回後買上漲全通過", "近3日向上跳空缺口"],
-    ["KDJ近3日內黃金交叉", "創52週新高", "近3日向上跳空缺口"],
-    ["量能斜率轉強(近5日均量>近10日均量20%以上)", "創52週新高", "晨星剛形成"],
-    ["量能斜率轉弱(近5日均量<近10日均量20%以上)", "大盤站上60日均線", "創52週新高"],
-    ["大盤站上60日均線", "均線多頭排列(5>20>60且站上月線)", "晨星剛形成"],
-    ["回後買上漲全通過", "創52週新高", "近3月均價YoY為負"],
-    ["創52週新高", "近3月均價YoY為負", "突破飆股大量黑K最高點剛形成"],
-    ["相對強弱為正(強於大盤)", "創52週新高", "近3日向上跳空缺口"],
-    ["量能斜率轉弱(近5日均量<近10日均量20%以上)", "回後買上漲全通過", "距52週高點≤5%"],
-    ["回後買上漲全通過", "距52週高點≤5%", "近3日向上跳空缺口"],
-    ["均線多頭排列(5>20>60且站上月線)", "三大法人近3月買超", "晨星剛形成"],
-    ["多方力道≥65", "均線多頭排列(5>20>60且站上月線)", "晨星剛形成"],
-    ["相對強弱為正(強於大盤)", "量能斜率轉弱(近5日均量<近10日均量20%以上)", "創52週新高"],
+    ["大盤跌破60日均線", "DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR)", "晨星剛形成"],
+    ["DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR)", "K線橫盤的突破剛形成", "晨星剛形成"],
+    ["均線多頭排列(5>20>60且站上月線)", "K線橫盤的突破剛形成", "晨星剛形成"],
+    ["多方力道≥80", "地量(≤0.5倍均量)", "創52週新高"],
+    ["距52週高點≤5%", "K線橫盤的突破剛形成", "晨星剛形成"],
+    ["地量(≤0.5倍均量)", "回後買上漲全通過", "創52週新高"],
+    ["布林通道高檔(≥80%)", "量能區間低檔(≤10百分位)", "創52週新高"],
+    ["地量(≤0.5倍均量)", "距52週高點≤5%", "突破ABC修正下降切線剛形成"],
+    ["地量(≤0.5倍均量)", "創52週新高", "DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR)"],
+    ["量能斜率轉弱(近5日均量<近10日均量20%以上)", "均線多頭排列(5>20>60且站上月線)", "晨星剛形成"],
     ["地量(≤0.5倍均量)", "量能區間高檔(≥90百分位)", "距52週高點≤5%"],
-    ["回後買上漲全通過", "創52週新高", "晨星剛形成"],
-    ["創52週新高", "均線多頭排列(5>20>60且站上月線)", "近3日向上跳空缺口"],
-    ["均線多頭排列(5>20>60且站上月線)", "晨星剛形成"],
-    ["多方力道≥65", "距52週高點≤5%", "晨星剛形成"],
-    ["KDJ近3日內死亡交叉", "創52週新高", "近3日向上跳空缺口"],
-    ["爆量(≥1.5倍均量)", "創52週新高", "晨星剛形成"],
-    ["量能區間高檔(≥90百分位)", "創52週新高", "晨星剛形成"],
-    ["量能斜率轉強(近5日均量>近10日均量20%以上)", "創52週新高", "N字底剛形成"],
-    ["均線多頭排列(5>20>60且站上月線)", "突破ABC修正下降切線剛形成", "晨星剛形成"],
-    ["強勢突破盤", "距52週高點≤5%", "晨星剛形成"],
-    ["布林通道高檔(≥80%)", "均線多頭排列(5>20>60且站上月線)", "晨星剛形成"],
-    ["爆量(≥1.5倍均量)", "量能斜率轉弱(近5日均量<近10日均量20%以上)", "距52週高點≤5%"],
-    ["量能區間高檔(≥90百分位)", "量能斜率轉弱(近5日均量<近10日均量20%以上)", "創52週新高"],
-    ["創52週新高", "近3日向上跳空缺口", "三大法人近3月買超"],
-    ["創52週新高", "近3日向上跳空缺口", "突破飆股大量黑K最高點剛形成"],
-    ["距52週高點≤5%", "三大法人近3月賣超", "突破飆股大量黑K最高點剛形成"],
-    ["創52週新高", "近3日向上跳空缺口"],
-    ["多方力道≥65", "量能斜率轉弱(近5日均量<近10日均量20%以上)", "創52週新高"],
-    ["多方力道≥80", "創52週新高", "N字底剛形成"],
-    ["布林通道高檔(≥80%)", "創52週新高", "近3日向上跳空缺口"],
-    ["KDJ近3日內黃金交叉", "均線多頭排列(5>20>60且站上月線)", "晨星剛形成"],
-    ["量能斜率轉弱(近5日均量<近10日均量20%以上)", "創52週新高", "近3月乖離度為負(股價超前營收)"],
-    ["大盤站上20日均線", "創52週新高", "近3日向上跳空缺口"],
-    ["大盤站上20日均線", "創52週新高", "N字底剛形成"],
-    ["大盤跌破20日均線", "創52週新高", "近3日向上跳空缺口"],
-    ["創52週新高", "距52週高點≤5%", "母子懷抱(低檔)剛形成"],
-    ["布林通道高檔(≥80%)", "量能斜率轉弱(近5日均量<近10日均量20%以上)", "創52週新高"],
-    ["量能斜率轉弱(近5日均量<近10日均量20%以上)", "大盤站上20日均線", "創52週新高"],
-    ["創52週新高", "距52週高點≤5%", "近3日向上跳空缺口"],
-    ["創52週新高", "近3日向上跳空缺口", "近3月乖離度為負(股價超前營收)"],
+    ["量能斜率轉弱(近5日均量<近10日均量20%以上)", "創52週新高", "近3日向上跳空缺口"],
+    ["多方力道≥80", "距52週高點≤5%", "晨星剛形成"],
+    ["大盤跌破60日均線", "外資近5日買超", "夜星剛形成"],
+    ["距52週高點≤5%", "近3月均價YoY為正", "晨星剛形成"],
     ["創52週新高", "近3月乖離度為正(營收優於股價)", "N字底剛形成"],
-    ["創52週新高", "近3月乖離度為正(營收優於股價)", "突破飆股大量黑K最高點剛形成"],
-    ["距52週高點≤5%", "近3日向上跳空缺口", "N字底剛形成"],
-    ["均線多頭排列(5>20>60且站上月線)", "三大法人近3月賣超", "晨星剛形成"],
-    ["多方力道≥80", "回後買上漲全通過", "創52週新高"],
-    ["多方力道≥80", "近3日向上跳空缺口", "N字底剛形成"],
-    ["強勢突破盤", "創52週新高", "近3日向上跳空缺口"],
-    ["KDJ近3日內黃金交叉", "創52週新高", "N字底剛形成"],
-    ["量能區間高檔(≥90百分位)", "創52週新高", "N字底剛形成"],
-    ["量能斜率轉弱(近5日均量<近10日均量20%以上)", "均線多頭排列(5>20>60且站上月線)", "近3日向上跳空缺口"],
-    ["創52週新高", "近3日向上跳空缺口", "近3月均價YoY為正"],
+    ["大盤站上20日均線", "距52週高點≤5%", "晨星剛形成"],
     ["創52週新高", "近3日向上跳空缺口", "三大法人近3月賣超"],
-    ["距52週高點≤5%", "N字底剛形成", "突破飆股大量黑K最高點剛形成"],
-    ["多方力道≥80", "距52週高點≤5%", "近3日向上跳空缺口"],
+    ["相對強弱為正(強於大盤)", "地量(≤0.5倍均量)", "創52週新高"],
+    ["地量(≤0.5倍均量)", "大盤站上20日均線", "創52週新高"],
     ["創52週新高", "近3日向上跳空缺口", "突破ABC修正下降切線剛形成"],
-    ["距52週高點≤5%", "近3月乖離度為負(股價超前營收)", "母子懷抱(低檔)剛形成"],
-    ["量能斜率轉強(近5日均量>近10日均量20%以上)", "均線多頭排列(5>20>60且站上月線)", "晨星剛形成"],
-    ["量能斜率轉弱(近5日均量<近10日均量20%以上)", "大盤跌破60日均線", "母子懷抱(高檔)剛形成"],
-    ["量能斜率轉弱(近5日均量<近10日均量20%以上)", "創52週新高", "均線多頭排列(5>20>60且站上月線)"],
-    ["創52週新高", "近3月均價YoY為負", "突破ABC修正下降切線剛形成"],
-    ["量能斜率轉弱(近5日均量<近10日均量20%以上)", "創52週新高"],
-    ["地量(≤0.5倍均量)", "創52週新高", "近3月乖離度為正(營收優於股價)"],
-    ["量能區間高檔(≥90百分位)", "量能斜率轉弱(近5日均量<近10日均量20%以上)", "近3日向上跳空缺口"],
-    ["量能區間高檔(≥90百分位)", "距52週高點≤5%", "晨星剛形成"],
-    ["回後買上漲全通過", "創52週新高", "N字底剛形成"],
-    ["近3日向上跳空缺口", "三大法人近3月買超", "母子懷抱(低檔)剛形成"],
-    ["MACD近3日內黃金交叉", "創52週新高", "N字底剛形成"],
-    ["多方力道≥65", "地量(≤0.5倍均量)", "近3日向上跳空缺口"],
-    ["多方力道≥65", "回後買上漲全通過", "創52週新高"],
-    ["量能區間低檔(≤10百分位)", "均線多頭排列(5>20>60且站上月線)", "近3日向上跳空缺口"],
-    ["量能斜率轉弱(近5日均量<近10日均量20%以上)", "創52週新高", "三大法人近3月買超"],
-    ["大盤站上20日均線", "回後買上漲全通過", "創52週新高"],
-    ["大盤站上20日均線", "創52週新高", "突破飆股大量黑K最高點剛形成"],
-    ["距52週高點≤5%", "近3日向上跳空缺口", "突破飆股大量黑K最高點剛形成"],
-    ["MACD近3日內黃金交叉", "均線多頭排列(5>20>60且站上月線)", "夜星剛形成"],
-    ["相對強弱為正(強於大盤)", "回後買上漲全通過", "創52週新高"],
-    ["爆量(≥1.5倍均量)", "創52週新高", "N字底剛形成"],
-    ["爆量(≥1.5倍均量)", "距52週高點≤5%", "晨星剛形成"],
-    ["大盤站上60日均線", "回後買上漲全通過", "創52週新高"],
-    ["大盤站上60日均線", "創52週新高", "突破飆股大量黑K最高點剛形成"],
-    ["大盤跌破60日均線", "均線多頭排列(5>20>60且站上月線)", "夜星剛形成"],
-    ["回後買上漲全通過", "距52週高點≤5%", "晨星剛形成"],
-    ["創52週新高", "突破ABC修正下降切線剛形成", "突破飆股大量黑K最高點剛形成"],
-    ["距52週高點≤5%", "近3月均價YoY為負", "突破飆股大量黑K最高點剛形成"],
-    ["強勢突破盤", "創52週新高", "晨星剛形成"],
-    ["KDJ近3日內黃金交叉", "量能斜率轉弱(近5日均量<近10日均量20%以上)", "創52週新高"],
-    ["地量(≤0.5倍均量)", "量能區間高檔(≥90百分位)", "近3日向上跳空缺口"],
-    ["大盤站上60日均線", "創52週新高", "N字底剛形成"],
-    ["回後買上漲全通過", "創52週新高", "突破ABC修正下降切線剛形成"],
-    ["多方力道≥65", "創52週新高", "N字底剛形成"],
-    ["多方力道≥65", "距52週高點≤5%", "近3日向上跳空缺口"],
-    ["多方力道≥80", "回後買上漲全通過", "距52週高點≤5%"],
-    ["相對強弱為正(強於大盤)", "創52週新高", "N字底剛形成"],
-    ["量能區間高檔(≥90百分位)", "創52週新高", "近3日向上跳空缺口"],
-    ["量能斜率轉強(近5日均量>近10日均量20%以上)", "創52週新高", "近3日向上跳空缺口"],
-    ["量能斜率轉弱(近5日均量<近10日均量20%以上)", "創52週新高", "距52週高點≤5%"],
-    ["大盤站上20日均線", "近3日向上跳空缺口", "母子懷抱(低檔)剛形成"],
-    ["回後買上漲全通過", "創52週新高", "均線多頭排列(5>20>60且站上月線)"],
-    ["回後買上漲全通過", "創52週新高", "突破飆股大量黑K最高點剛形成"],
-    ["創52週新高", "近3月均價YoY為負", "三大法人近3月賣超"],
-    ["距52週高點≤5%", "圓弧底剛形成", "突破ABC修正下降切線剛形成"],
-    ["回後買上漲全通過", "創52週新高"],
-    ["多方力道≥80", "創52週新高", "近3月均價YoY為負"],
-    ["多方力道≥80", "距52週高點≤5%", "N字底剛形成"],
-    ["強勢突破盤", "均線多頭排列(5>20>60且站上月線)", "晨星剛形成"],
-    ["布林通道高檔(≥80%)", "量能斜率轉弱(近5日均量<近10日均量20%以上)", "近3日向上跳空缺口"],
-    ["布林通道高檔(≥80%)", "回後買上漲全通過", "創52週新高"],
-    ["相對強弱為負(弱於大盤)", "量能斜率轉弱(近5日均量<近10日均量20%以上)", "晨星剛形成"],
-    ["爆量(≥1.5倍均量)", "量能斜率轉弱(近5日均量<近10日均量20%以上)", "近3日向上跳空缺口"],
-    ["量能斜率轉強(近5日均量>近10日均量20%以上)", "創52週新高", "近3月均價YoY為負"],
-    ["大盤站上60日均線", "創52週新高", "近3月均價YoY為負"],
-    ["回後買上漲全通過", "創52週新高", "距52週高點≤5%"],
-    ["回後買上漲全通過", "創52週新高", "三大法人近3月買超"],
-    ["回後買上漲全通過", "均線多頭排列(5>20>60且站上月線)", "近3日向上跳空缺口"],
-    ["均線多頭排列(5>20>60且站上月線)", "近3月均價YoY為負", "晨星剛形成"],
-    ["近3日向上跳空缺口", "近3月乖離度為負(股價超前營收)", "母子懷抱(低檔)剛形成"],
-    ["多方力道≥65", "創52週新高", "突破飆股大量黑K最高點剛形成"],
-    ["KDJ近3日內黃金交叉", "近3月乖離度為負(股價超前營收)", "夜星剛形成"],
-    ["相對強弱為正(強於大盤)", "創52週新高", "突破飆股大量黑K最高點剛形成"],
-    ["相對強弱為正(強於大盤)", "距52週高點≤5%", "近3日向上跳空缺口"],
-    ["爆量(≥1.5倍均量)", "創52週新高", "近3日向上跳空缺口"],
-    ["爆量(≥2倍均量)", "均線多頭排列(5>20>60且站上月線)", "晨星剛形成"],
-    ["回後買上漲全通過", "創52週新高", "近3月乖離度為正(營收優於股價)"],
-    ["創52週新高", "均線多頭排列(5>20>60且站上月線)", "N字底剛形成"],
-    ["距52週高點≤5%", "三大法人近3月賣超", "N字底剛形成"],
-    ["強勢突破盤", "回後買上漲全通過", "創52週新高"],
-    ["相對強弱為正(強於大盤)", "創52週新高", "近3月均價YoY為負"],
-    ["量能區間高檔(≥90百分位)", "回後買上漲全通過", "創52週新高"],
-    ["量能斜率轉強(近5日均量>近10日均量20%以上)", "回後買上漲全通過", "創52週新高"],
-    ["回後買上漲全通過", "創52週新高", "三大法人近3月賣超"],
-    ["創52週新高", "距52週高點≤5%", "突破飆股大量黑K最高點剛形成"],
-    ["距52週高點≤5%", "近3日向上跳空缺口", "突破ABC修正下降切線剛形成"],
-    ["均線多頭排列(5>20>60且站上月線)", "近3月乖離度為負(股價超前營收)", "母子懷抱(低檔)剛形成"],
-    ["均線多頭排列(5>20>60且站上月線)", "近3月均價YoY為正", "夜星剛形成"],
-    ["均線多頭排列(5>20>60且站上月線)", "母子懷抱(低檔)剛形成", "晨星剛形成"],
-    ["創52週新高", "N字底剛形成"],
-    ["布林通道高檔(≥80%)", "創52週新高", "N字底剛形成"],
-    ["MACD近3日內黃金交叉", "創52週新高", "突破飆股大量黑K最高點剛形成"],
-    ["MACD近3日內黃金交叉", "均線多頭排列(5>20>60且站上月線)", "晨星剛形成"],
-    ["地量(≤0.5倍均量)", "近3月乖離度為負(股價超前營收)", "晨星剛形成"],
-    ["量能區間高檔(≥90百分位)", "近3月乖離度為負(股價超前營收)", "夜星剛形成"],
-    ["量能斜率轉弱(近5日均量<近10日均量20%以上)", "創52週新高", "N字底剛形成"],
-    ["大盤跌破20日均線", "大盤站上60日均線", "創52週新高"],
-    ["大盤站上60日均線", "創52週新高", "突破ABC修正下降切線剛形成"],
-    ["回後買上漲全通過", "距52週高點≤5%", "近3月均價YoY為負"],
-    ["創52週新高", "近3月乖離度為正(營收優於股價)", "近3月均價YoY為負"],
-    ["距52週高點≤5%", "近3日向上跳空缺口", "近3月均價YoY為負"],
-    ["創52週新高", "突破飆股大量黑K最高點剛形成"],
-    ["多方力道≥65", "創52週新高", "近3月均價YoY為負"],
-    ["強勢突破盤", "距52週高點≤5%", "近3日向上跳空缺口"],
-    ["KDJ近3日內黃金交叉", "回後買上漲全通過", "創52週新高"],
-    ["相對強弱為正(強於大盤)", "大盤站上60日均線", "創52週新高"],
-    ["爆量(≥1.5倍均量)", "均線多頭排列(5>20>60且站上月線)", "晨星剛形成"],
-    ["爆量(≥2倍均量)", "創52週新高", "近3月均價YoY為負"],
-    ["量能區間高檔(≥90百分位)", "創52週新高", "近3月均價YoY為負"],
-    ["創52週新高", "距52週高點≤5%", "N字底剛形成"],
-    ["距52週高點≤5%", "均線多頭排列(5>20>60且站上月線)", "近3日向上跳空缺口"],
-    ["距52週高點≤5%", "母子懷抱(低檔)剛形成", "晨星剛形成"],
-    ["均線多頭排列(5>20>60且站上月線)", "三大法人近3月買超", "夜星剛形成"],
-    ["多方力道≥80", "大盤站上20日均線", "創52週新高"],
-    ["多方力道≥80", "大盤站上60日均線", "創52週新高"],
-    ["多方力道≥80", "近3日向上跳空缺口", "近3月均價YoY為正"],
-    ["強勢突破盤", "創52週新高", "突破飆股大量黑K最高點剛形成"],
-    ["布林通道高檔(≥80%)", "地量(≤0.5倍均量)", "距52週高點≤5%"],
-    ["相對強弱為負(弱於大盤)", "近3月均價YoY為負", "夜星剛形成"],
-    ["爆量(≥1.5倍均量)", "創52週新高", "近3月均價YoY為負"],
-    ["爆量(≥2倍均量)", "創52週新高", "N字底剛形成"],
-    ["爆量(≥2倍均量)", "創52週新高", "突破ABC修正下降切線剛形成"],
-    ["爆量(≥2倍均量)", "均線多頭排列(5>20>60且站上月線)", "母子懷抱(低檔)剛形成"],
-    ["地量(≤0.5倍均量)", "量能斜率轉弱(近5日均量<近10日均量20%以上)", "母子懷抱(高檔)剛形成"],
-    ["量能斜率轉強(近5日均量>近10日均量20%以上)", "創52週新高", "三大法人近3月賣超"],
-    ["量能斜率轉強(近5日均量>近10日均量20%以上)", "創52週新高", "突破ABC修正下降切線剛形成"],
-    ["量能斜率轉弱(近5日均量<近10日均量20%以上)", "創52週新高", "近3月均價YoY為正"],
+    ["距52週高點≤5%", "突破飆股大量黑K最高點剛形成", "晨星剛形成"],
+    ["爆量(≥2倍均量)", "量能斜率轉弱(近5日均量<近10日均量20%以上)", "創52週新高"],
+    ["量能區間低檔(≤10百分位)", "大盤站上60日均線", "創52週新高"],
+    ["相對強弱為正(強於大盤)", "量能區間低檔(≤10百分位)", "創52週新高"],
+    ["MACD近3日內黃金交叉", "均線多頭排列(5>20>60且站上月線)", "母子懷抱(低檔)剛形成"],
     ["量能斜率轉弱(近5日均量<近10日均量20%以上)", "距52週高點≤5%", "K線橫盤的突破剛形成"],
-    ["大盤站上20日均線", "創52週新高", "近3月均價YoY為負"],
-    ["大盤站上20日均線", "距52週高點≤5%", "突破飆股大量黑K最高點剛形成"],
-    ["大盤站上60日均線", "距52週高點≤5%", "近3日向上跳空缺口"],
-    ["回後買上漲全通過", "創52週新高", "近3月均價YoY為正"],
-    ["回後買上漲全通過", "近3日向上跳空缺口", "突破ABC修正下降切線剛形成"],
-    ["創52週新高", "均線多頭排列(5>20>60且站上月線)", "近3月均價YoY為負"],
-    ["距52週高點≤5%", "近3月乖離度為正(營收優於股價)", "晨星剛形成"],
-    ["距52週高點≤5%", "近3月均價YoY為負", "N字底剛形成"],
-    ["創52週新高", "近3月均價YoY為負"],
-    ["多方力道≥65", "大盤站上60日均線", "創52週新高"],
-    ["多方力道≥65", "回後買上漲全通過", "距52週高點≤5%"],
-    ["多方力道≥65", "回後買上漲全通過", "近3日向上跳空缺口"],
-    ["多方力道≥80", "強勢突破盤", "創52週新高"],
-    ["多方力道≥80", "相對強弱為正(強於大盤)", "創52週新高"],
-    ["多方力道≥80", "回後買上漲全通過", "均線多頭排列(5>20>60且站上月線)"],
+    ["距52週高點≤5%", "DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR)", "晨星剛形成"],
+    ["多方力道≥80", "創52週新高", "N字底剛形成"],
+    ["大盤站上60日均線", "距52週高點≤5%", "晨星剛形成"],
+    ["創52週新高", "DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR)", "突破ABC修正下降切線剛形成"],
+    ["回後買上漲全通過", "創52週新高", "近3月乖離度為正(營收優於股價)"],
     ["多方力道≥80", "創52週新高", "突破ABC修正下降切線剛形成"],
-    ["布林通道高檔(≥80%)", "距52週高點≤5%", "近3日向上跳空缺口"],
-    ["MACD近3日內黃金交叉", "創52週新高", "近3日向上跳空缺口"],
-    ["KDJ近3日內黃金交叉", "距52週高點≤5%", "晨星剛形成"],
-    ["爆量(≥2倍均量)", "創52週新高", "近3日向上跳空缺口"],
+    ["KDJ近3日內死亡交叉", "創52週新高", "近3月乖離度為正(營收優於股價)"],
+    ["強勢突破盤", "地量(≤0.5倍均量)", "連續放量(近3日均量≥1.5倍前20日均量)"],
+    ["地量(≤0.5倍均量)", "回後買上漲全通過", "距52週高點≤5%"],
+    ["多方力道≥65", "地量(≤0.5倍均量)", "創52週新高"],
+    ["地量(≤0.5倍均量)", "創52週新高", "均線多頭排列(5>20>60且站上月線)"],
+    ["地量(≤0.5倍均量)", "創52週新高"],
+    ["連續放量(近3日均量≥1.5倍前20日均量)", "突破飆股大量黑K最高點剛形成", "晨星剛形成"],
+    ["地量(≤0.5倍均量)", "量能斜率轉弱(近5日均量<近10日均量20%以上)", "創52週新高"],
+    ["外資近5日買超", "K線橫盤的突破剛形成", "晨星剛形成"],
+    ["創52週新高", "連續放量(近3日均量≥1.5倍前20日均量)", "突破ABC修正下降切線剛形成"],
+    ["回後買上漲全通過", "創52週新高", "三大法人近3月賣超"],
+    ["布林通道高檔(≥80%)", "地量(≤0.5倍均量)", "創52週新高"],
+    ["地量(≤0.5倍均量)", "創52週新高", "距52週高點≤5%"],
+    ["均線多頭排列(5>20>60且站上月線)", "突破飆股大量黑K最高點剛形成", "晨星剛形成"],
+    ["強勢突破盤", "地量(≤0.5倍均量)", "DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR)"],
+    ["多方力道≥80", "均線多頭排列(5>20>60且站上月線)", "晨星剛形成"],
+    ["三大法人近3月買超", "DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR)", "晨星剛形成"],
+    ["距52週高點≤5%", "均線多頭排列(5>20>60且站上月線)", "晨星剛形成"],
+    ["地量(≤0.5倍均量)", "距52週高點≤5%", "近3日向上跳空缺口"],
+    ["地量(≤0.5倍均量)", "量能斜率轉強(近5日均量>近10日均量20%以上)", "創52週新高"],
+    ["創52週新高", "三大法人近3月買超", "母子懷抱(低檔)剛形成"],
+    ["連續放量(近3日均量≥1.5倍前20日均量)", "K線橫盤的突破剛形成", "晨星剛形成"],
+    ["多方力道≥65", "創52週新高", "母子懷抱(低檔)剛形成"],
+    ["布林通道高檔(≥80%)", "創52週新高", "母子懷抱(低檔)剛形成"],
+    ["量能斜率轉強(近5日均量>近10日均量20%以上)", "距52週高點≤5%", "晨星剛形成"],
+    ["距52週高點≤5%", "連續放量(近3日均量≥1.5倍前20日均量)", "晨星剛形成"],
+    ["量能區間低檔(≤10百分位)", "創52週新高", "三大法人近3月買超"],
+    ["量能斜率轉弱(近5日均量<近10日均量20%以上)", "創52週新高", "N字底剛形成"],
+    ["多方力道≥80", "創52週新高", "近3月乖離度為正(營收優於股價)"],
+    ["多方力道≥65", "距52週高點≤5%", "晨星剛形成"],
+    ["大盤站上20日均線", "創52週新高", "N字底剛形成"],
+    ["大盤站上20日均線", "創52週新高", "近3日向上跳空缺口"],
+    ["創52週新高", "DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR)", "N字底剛形成"],
+    ["量能區間高檔(≥90百分位)", "創52週新高", "近3月乖離度為正(營收優於股價)"],
+    ["大盤站上20日均線", "DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR)", "晨星剛形成"],
+    ["量能斜率轉弱(近5日均量<近10日均量20%以上)", "距52週高點≤5%", "近3日向上跳空缺口"],
+    ["距52週高點≤5%", "晨星剛形成"],
+    ["創52週新高", "近3日向上跳空缺口", "DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR)"],
+    ["多方力道≥80", "創52週新高", "近3日向上跳空缺口"],
+    ["強勢突破盤", "DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR)", "晨星剛形成"],
+    ["多方力道≥65", "創52週新高", "N字底剛形成"],
+    ["KDJ近3日內黃金交叉", "創52週新高", "N字底剛形成"],
+    ["多方力道≥80", "連續放量(近3日均量≥1.5倍前20日均量)", "晨星剛形成"],
+    ["DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR)", "突破ABC修正下降切線剛形成", "突破飆股大量黑K最高點剛形成"],
+    ["相對強弱為正(強於大盤)", "創52週新高", "突破ABC修正下降切線剛形成"],
+    ["近3日向上跳空缺口", "投信連續買超≥3日", "突破ABC修正下降切線剛形成"],
+    ["布林通道高檔(≥80%)", "距52週高點≤5%", "晨星剛形成"],
+    ["距52週高點≤5%", "外資近5日買超", "晨星剛形成"],
+    ["量能區間高檔(≥90百分位)", "量能斜率轉弱(近5日均量<近10日均量20%以上)", "近3日向上跳空缺口"],
+    ["DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR)", "母子懷抱(低檔)剛形成", "晨星剛形成"],
+    ["創52週新高", "近3月乖離度為正(營收優於股價)", "DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR)"],
     ["爆量(≥2倍均量)", "創52週新高", "三大法人近3月賣超"],
-    ["量能區間高檔(≥90百分位)", "量能斜率轉弱(近5日均量<近10日均量20%以上)", "母子懷抱(低檔)剛形成"],
-    ["量能區間高檔(≥90百分位)", "距52週高點≤5%", "N字底剛形成"],
-    ["量能斜率轉弱(近5日均量<近10日均量20%以上)", "創52週新高", "近3月乖離度為正(營收優於股價)"],
-    ["大盤站上60日均線", "距52週高點≤5%", "突破飆股大量黑K最高點剛形成"],
-    ["回後買上漲全通過", "創52週新高", "近3月乖離度為負(股價超前營收)"],
-    ["回後買上漲全通過", "均線多頭排列(5>20>60且站上月線)", "晨星剛形成"],
-    ["回後買上漲全通過", "近3月乖離度為負(股價超前營收)", "晨星剛形成"],
-    ["創52週新高", "均線多頭排列(5>20>60且站上月線)", "突破飆股大量黑K最高點剛形成"],
-    ["創52週新高", "三大法人近3月買超", "N字底剛形成"],
-    ["多方力道≥80", "回後買上漲全通過"],
-    ["近3月乖離度為負(股價超前營收)", "晨星剛形成"],
-    ["多方力道≥65", "相對強弱為正(強於大盤)", "創52週新高"],
-    ["多方力道≥65", "回後買上漲全通過", "晨星剛形成"],
-    ["多方力道≥65", "創52週新高", "突破ABC修正下降切線剛形成"],
-    ["多方力道≥65", "均線多頭排列(5>20>60且站上月線)", "母子懷抱(低檔)剛形成"],
-    ["多方力道≥80", "布林通道高檔(≥80%)", "回後買上漲全通過"],
-    ["多方力道≥80", "量能區間高檔(≥90百分位)", "回後買上漲全通過"],
-    ["多方力道≥80", "大盤站上60日均線", "近3日向上跳空缺口"],
-    ["多方力道≥80", "創52週新高", "三大法人近3月賣超"],
-    ["多方力道≥80", "近3日向上跳空缺口", "三大法人近3月買超"],
-    ["KDJ近3日內死亡交叉", "距52週高點≤5%", "晨星剛形成"],
-    ["相對強弱為正(強於大盤)", "大盤站上20日均線", "創52週新高"],
-    ["相對強弱為正(強於大盤)", "回後買上漲全通過", "距52週高點≤5%"],
-    ["爆量(≥1.5倍均量)", "回後買上漲全通過", "創52週新高"],
-    ["量能區間高檔(≥90百分位)", "創52週新高", "三大法人近3月賣超"],
-    ["量能斜率轉弱(近5日均量<近10日均量20%以上)", "回後買上漲全通過", "均線多頭排列(5>20>60且站上月線)"],
     ["大盤站上20日均線", "創52週新高", "三大法人近3月賣超"],
-    ["回後買上漲全通過", "近3日向上跳空缺口", "三大法人近3月買超"],
-    ["回後買上漲全通過", "母子懷抱(低檔)剛形成", "晨星剛形成"],
-    ["創52週新高", "近3月均價YoY為負", "三大法人近3月買超"],
-    ["距52週高點≤5%", "突破ABC修正下降切線剛形成", "突破飆股大量黑K最高點剛形成"],
-    ["均線多頭排列(5>20>60且站上月線)", "近3日向上跳空缺口", "突破飆股大量黑K最高點剛形成"],
-    ["均線多頭排列(5>20>60且站上月線)", "近3月乖離度為正(營收優於股價)", "晨星剛形成"],
-    ["近3日向上跳空缺口", "近3月均價YoY為正", "突破飆股大量黑K最高點剛形成"],
-    ["多方力道≥65", "大盤站上20日均線", "創52週新高"],
-    ["多方力道≥80", "強勢突破盤", "回後買上漲全通過"],
-    ["多方力道≥80", "強勢突破盤", "近3日向上跳空缺口"],
-    ["多方力道≥80", "布林通道高檔(≥80%)", "創52週新高"],
-    ["布林通道高檔(≥80%)", "創52週新高", "近3月均價YoY為負"],
-    ["MACD近3日內黃金交叉", "量能區間高檔(≥90百分位)", "N字底剛形成"],
-    ["MACD近3日內黃金交叉", "近3日向上跳空缺口", "突破飆股大量黑K最高點剛形成"],
-    ["KDJ近3日內黃金交叉", "創52週新高", "三大法人近3月賣超"],
-    ["相對強弱為正(強於大盤)", "創52週新高", "三大法人近3月賣超"],
+    ["距52週高點≤5%", "近3月乖離度為負(股價超前營收)", "晨星剛形成"],
+    ["多方力道≥80", "量能斜率轉弱(近5日均量<近10日均量20%以上)", "近3日向上跳空缺口"],
+    ["大盤站上20日均線", "創52週新高", "突破飆股大量黑K最高點剛形成"],
+    ["連續放量(近3日均量≥1.5倍前20日均量)", "DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR)", "突破ABC修正下降切線剛形成"],
+    ["爆量(≥1.5倍均量)", "均線多頭排列(5>20>60且站上月線)", "母子懷抱(低檔)剛形成"],
+    ["多方力道≥80", "大盤站上20日均線", "突破飆股大量黑K最高點剛形成"],
+    ["大盤站上20日均線", "創52週新高", "近3月乖離度為正(營收優於股價)"],
+    ["相對強弱為正(強於大盤)", "DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR)", "晨星剛形成"],
+    ["創52週新高", "近3日向上跳空缺口", "近3月均價YoY為負"],
+    ["多方力道≥80", "距52週高點≤5%", "N字底剛形成"],
+    ["創52週新高", "連續放量(近3日均量≥1.5倍前20日均量)", "近3月乖離度為正(營收優於股價)"],
+    ["量能斜率轉強(近5日均量>近10日均量20%以上)", "創52週新高", "三大法人近3月賣超"],
+    ["創52週新高", "連續放量(近3日均量≥1.5倍前20日均量)", "三大法人近3月賣超"],
+    ["地量(≤0.5倍均量)", "回後買上漲全通過", "DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR)"],
+    ["地量(≤0.5倍均量)", "DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR)", "晨星剛形成"],
+    ["量能區間低檔(≤10百分位)", "創52週新高", "近3月乖離度為負(股價超前營收)"],
+    ["相對強弱為正(強於大盤)", "創52週新高", "母子懷抱(低檔)剛形成"],
+    ["創52週新高", "母子懷抱(低檔)剛形成"],
+    ["距52週高點≤5%", "三大法人近3月買超", "晨星剛形成"],
+    ["相對強弱為正(強於大盤)", "距52週高點≤5%", "晨星剛形成"],
+    ["大盤跌破20日均線", "外資近5日買超", "夜星剛形成"],
+    ["量能區間低檔(≤10百分位)", "創52週新高"],
+    ["量能區間低檔(≤10百分位)", "創52週新高", "距52週高點≤5%"],
+    ["均線多頭排列(5>20>60且站上月線)", "DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR)", "晨星剛形成"],
+    ["量能斜率轉弱(近5日均量<近10日均量20%以上)", "創52週新高", "三大法人近3月賣超"],
+    ["地量(≤0.5倍均量)", "量能區間高檔(≥90百分位)", "近3日向上跳空缺口"],
+    ["創52週新高", "突破ABC修正下降切線剛形成", "突破飆股大量黑K最高點剛形成"],
+    ["大盤跌破60日均線", "均線多頭排列(5>20>60且站上月線)", "晨星剛形成"],
+    ["爆量(≥2倍均量)", "創52週新高", "突破ABC修正下降切線剛形成"],
+    ["爆量(≥2倍均量)", "大盤站上20日均線", "母子懷抱(低檔)剛形成"],
+    ["多方力道≥80", "創52週新高", "三大法人近3月賣超"],
+    ["量能區間高檔(≥90百分位)", "創52週新高", "三大法人近3月賣超"],
+    ["多方力道≥65", "創52週新高", "近3日向上跳空缺口"],
+    ["量能斜率轉強(近5日均量>近10日均量20%以上)", "均線多頭排列(5>20>60且站上月線)", "晨星剛形成"],
+    ["量能斜率轉強(近5日均量>近10日均量20%以上)", "創52週新高", "突破ABC修正下降切線剛形成"],
+    ["創52週新高", "外資近5日買超", "N字底剛形成"],
+    ["創52週新高", "均線多頭排列(5>20>60且站上月線)", "突破ABC修正下降切線剛形成"],
+    ["地量(≤0.5倍均量)", "創52週新高", "外資近5日買超"],
+    ["多方力道≥80", "回後買上漲全通過", "創52週新高"],
+    ["相對強弱為正(強於大盤)", "創52週新高", "N字底剛形成"],
+    ["創52週新高", "均線多頭排列(5>20>60且站上月線)", "N字底剛形成"],
+    ["創52週新高", "三大法人近3月買超", "N字底剛形成"],
+    ["創52週新高", "距52週高點≤5%", "突破ABC修正下降切線剛形成"],
+    ["爆量(≥1.5倍均量)", "創52週新高", "近3月乖離度為正(營收優於股價)"],
+    ["強勢突破盤", "地量(≤0.5倍均量)", "創52週新高"],
+    ["爆量(≥2倍均量)", "距52週高點≤5%", "晨星剛形成"],
+    ["DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR)", "晨星剛形成"],
+    ["創52週新高", "近3月乖離度為正(營收優於股價)", "突破飆股大量黑K最高點剛形成"],
+    ["回後買上漲全通過", "創52週新高", "DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR)"],
+    ["多方力道≥80", "距52週高點≤5%", "近3日向上跳空缺口"],
+    ["爆量(≥2倍均量)", "均線多頭排列(5>20>60且站上月線)", "母子懷抱(低檔)剛形成"],
+    ["大盤站上20日均線", "創52週新高", "突破ABC修正下降切線剛形成"],
+    ["量能區間高檔(≥90百分位)", "創52週新高", "突破ABC修正下降切線剛形成"],
+    ["多方力道≥80", "創52週新高", "連續放量(近3日均量≥1.5倍前20日均量)"],
+    ["布林通道高檔(≥80%)", "創52週新高", "突破ABC修正下降切線剛形成"],
+    ["多方力道≥80", "創52週新高", "突破飆股大量黑K最高點剛形成"],
+    ["多方力道≥80", "KDJ近3日內黃金交叉", "創52週新高"],
+    ["距52週高點≤5%", "連續放量(近3日均量≥1.5倍前20日均量)", "突破ABC修正下降切線剛形成"],
+    ["大盤站上60日均線", "創52週新高", "突破飆股大量黑K最高點剛形成"],
+    ["大盤站上60日均線", "創52週新高", "N字底剛形成"],
+    ["大盤站上20日均線", "回後買上漲全通過", "創52週新高"],
+    ["量能斜率轉強(近5日均量>近10日均量20%以上)", "DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR)", "突破ABC修正下降切線剛形成"],
+    ["布林通道高檔(≥80%)", "創52週新高", "N字底剛形成"],
+    ["創52週新高", "突破飆股大量黑K最高點剛形成", "K線橫盤的突破剛形成"],
+    ["創52週新高", "N字底剛形成"],
+    ["多方力道≥80", "回後買上漲全通過", "距52週高點≤5%"],
+    ["多方力道≥80", "大盤站上20日均線", "創52週新高"],
+    ["創52週新高", "突破ABC修正下降切線剛形成"],
+    ["多方力道≥80", "回後買上漲全通過", "外資近5日買超"],
+    ["多方力道≥80", "外資近5日買超", "N字底剛形成"],
+    ["大盤站上20日均線", "回後買上漲全通過", "DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR)"],
+    ["距52週高點≤5%", "DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR)", "突破ABC修正下降切線剛形成"],
+    ["爆量(≥2倍均量)", "創52週新高", "近3月乖離度為正(營收優於股價)"],
+    ["多方力道≥80", "量能斜率轉強(近5日均量>近10日均量20%以上)", "創52週新高"],
+    ["多方力道≥80", "量能區間高檔(≥90百分位)", "回後買上漲全通過"],
+    ["量能區間高檔(≥90百分位)", "量能斜率轉弱(近5日均量<近10日均量20%以上)", "距52週高點≤5%"],
+    ["量能斜率轉弱(近5日均量<近10日均量20%以上)", "創52週新高", "近3月均價YoY為負"],
+    ["地量(≤0.5倍均量)", "創52週新高", "三大法人近3月買超"],
+    ["強勢突破盤", "距52週高點≤5%", "晨星剛形成"],
+    ["創52週新高", "均線多頭排列(5>20>60且站上月線)", "近3日向上跳空缺口"],
+    ["量能區間高檔(≥90百分位)", "距52週高點≤5%", "晨星剛形成"],
+    ["多方力道≥65", "回後買上漲全通過", "創52週新高"],
+    ["多方力道≥65", "創52週新高", "突破ABC修正下降切線剛形成"],
+    ["相對強弱為正(強於大盤)", "創52週新高", "突破飆股大量黑K最高點剛形成"],
+    ["創52週新高", "距52週高點≤5%", "突破飆股大量黑K最高點剛形成"],
+    ["多方力道≥65", "距52週高點≤5%", "近3日向上跳空缺口"],
+    ["大盤站上20日均線", "距52週高點≤5%", "突破飆股大量黑K最高點剛形成"],
+    ["創52週新高", "連續放量(近3日均量≥1.5倍前20日均量)", "DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR)"],
+    ["距52週高點≤5%", "DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR)", "N字底剛形成"],
+    ["量能斜率轉強(近5日均量>近10日均量20%以上)", "創52週新高", "DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR)"],
+    ["多方力道≥80", "量能區間高檔(≥90百分位)", "創52週新高"],
+    ["量能區間低檔(≤10百分位)", "距52週高點≤5%", "近3日向上跳空缺口"],
+    ["KDJ近3日內黃金交叉", "地量(≤0.5倍均量)", "創52週新高"],
+    ["均線多頭排列(5>20>60且站上月線)", "突破飆股大量黑K最高點剛形成", "母子懷抱(低檔)剛形成"],
+    ["連續放量(近3日均量≥1.5倍前20日均量)", "突破飆股大量黑K最高點剛形成", "母子懷抱(低檔)剛形成"],
+    ["均線多頭排列(5>20>60且站上月線)", "近3月均價YoY為正", "晨星剛形成"],
+    ["多方力道≥65", "均線多頭排列(5>20>60且站上月線)", "晨星剛形成"],
+    ["創52週新高", "距52週高點≤5%", "近3日向上跳空缺口"],
+    ["地量(≤0.5倍均量)", "DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR)", "N字底剛形成"],
+    ["距52週高點≤5%", "近3月乖離度為正(營收優於股價)", "晨星剛形成"],
+    ["距52週高點≤5%", "母子懷抱(低檔)剛形成", "晨星剛形成"],
+    ["距52週高點≤5%", "近3日向上跳空缺口", "DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR)"],
+    ["強勢突破盤", "創52週新高", "突破飆股大量黑K最高點剛形成"],
+    ["回後買上漲全通過", "距52週高點≤5%", "DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR)"],
     ["爆量(≥1.5倍均量)", "創52週新高", "突破ABC修正下降切線剛形成"],
-    ["量能區間高檔(≥90百分位)", "均線多頭排列(5>20>60且站上月線)", "晨星剛形成"],
-    ["量能區間高檔(≥90百分位)", "圓弧底剛形成", "突破飆股大量黑K最高點剛形成"],
-    ["量能斜率轉強(近5日均量>近10日均量20%以上)", "大盤站上60日均線", "創52週新高"],
+    ["創52週新高", "距52週高點≤5%", "N字底剛形成"],
+    ["多方力道≥80", "強勢突破盤", "創52週新高"],
+    ["回後買上漲全通過", "DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR)", "N字底剛形成"],
+    ["多方力道≥80", "相對強弱為正(強於大盤)", "創52週新高"],
+    ["大盤站上20日均線", "創52週新高", "連續放量(近3日均量≥1.5倍前20日均量)"],
+    ["量能斜率轉弱(近5日均量<近10日均量20%以上)", "距52週高點≤5%", "N字底剛形成"],
+    ["多方力道≥80", "創52週新高", "外資近5日買超"],
+    ["量能區間高檔(≥90百分位)", "創52週新高", "DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR)"],
+    ["多方力道≥80", "爆量(≥1.5倍均量)", "創52週新高"],
+    ["量能斜率轉弱(近5日均量<近10日均量20%以上)", "大盤站上20日均線", "創52週新高"],
+    ["布林通道高檔(≥80%)", "創52週新高", "近3日向上跳空缺口"],
+    ["創52週新高", "突破飆股大量黑K最高點剛形成"],
+    ["回後買上漲全通過", "創52週新高", "突破飆股大量黑K最高點剛形成"],
+    ["創52週新高", "連續放量(近3日均量≥1.5倍前20日均量)", "突破飆股大量黑K最高點剛形成"],
+    ["多方力道≥80", "量能斜率轉弱(近5日均量<近10日均量20%以上)", "N字底剛形成"],
+    ["大盤站上20日均線", "創52週新高", "DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR)"],
+    ["KDJ近3日內黃金交叉", "回後買上漲全通過", "創52週新高"],
+    ["多方力道≥65", "創52週新高", "連續放量(近3日均量≥1.5倍前20日均量)"],
+    ["爆量(≥1.5倍均量)", "創52週新高", "突破飆股大量黑K最高點剛形成"],
+    ["多方力道≥65", "地量(≤0.5倍均量)", "量能區間高檔(≥90百分位)"],
+    ["爆量(≥2倍均量)", "大盤站上20日均線", "創52週新高"],
+    ["量能區間高檔(≥90百分位)", "大盤站上20日均線", "創52週新高"],
+    ["多方力道≥65", "近3日向上跳空缺口", "突破ABC修正下降切線剛形成"],
+    ["多方力道≥80", "布林通道高檔(≥80%)", "回後買上漲全通過"],
+    ["多方力道≥80", "布林通道高檔(≥80%)", "N字底剛形成"],
+    ["均線多頭排列(5>20>60且站上月線)", "近3月乖離度為負(股價超前營收)", "晨星剛形成"],
+    ["大盤站上20日均線", "均線多頭排列(5>20>60且站上月線)", "晨星剛形成"],
+    ["多方力道≥80", "地量(≤0.5倍均量)", "連續放量(近3日均量≥1.5倍前20日均量)"],
+    ["創52週新高", "近3月均價YoY為負", "突破ABC修正下降切線剛形成"],
+    ["多方力道≥80", "外資近5日買超", "晨星剛形成"],
+    ["創52週新高", "近3日向上跳空缺口"],
+    ["創52週新高", "近3日向上跳空缺口", "外資近5日買超"],
+    ["回後買上漲全通過", "創52週新高", "N字底剛形成"],
+    ["創52週新高", "DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR)", "突破飆股大量黑K最高點剛形成"],
+    ["創52週新高", "三大法人近3月買超", "突破ABC修正下降切線剛形成"],
+    ["強勢突破盤", "創52週新高", "DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR)"],
+    ["相對強弱為正(強於大盤)", "創52週新高", "DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR)"],
+    ["量能區間高檔(≥90百分位)", "回後買上漲全通過", "創52週新高"],
+    ["回後買上漲全通過", "三大法人近3月買超", "DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR)"],
+    ["多方力道≥80", "布林通道高檔(≥80%)", "創52週新高"],
+    ["多方力道≥80", "創52週新高", "DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR)"],
+    ["多方力道≥80", "近3月均價YoY為正", "N字底剛形成"],
+    ["爆量(≥1.5倍均量)", "創52週新高", "DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR)"],
+    ["近3月乖離度為正(營收優於股價)", "三重底剛形成", "突破飆股大量黑K最高點剛形成"],
+    ["多方力道≥80", "創52週新高"],
+    ["多方力道≥80", "爆量(≥2倍均量)", "創52週新高"],
+    ["多方力道≥80", "回後買上漲全通過", "均線多頭排列(5>20>60且站上月線)"],
+    ["KDJ近3日內黃金交叉", "創52週新高", "DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR)"],
+    ["多方力道≥80", "大盤站上20日均線", "近3日向上跳空缺口"],
+    ["多方力道≥80", "回後買上漲全通過", "DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR)"],
+    ["量能斜率轉強(近5日均量>近10日均量20%以上)", "大盤站上20日均線", "創52週新高"],
+    ["多方力道≥80", "回後買上漲全通過"],
+    ["量能區間高檔(≥90百分位)", "大盤站上20日均線", "母子懷抱(低檔)剛形成"],
+    ["布林通道高檔(≥80%)", "地量(≤0.5倍均量)", "近3日向上跳空缺口"],
+    ["強勢突破盤", "創52週新高", "近3日向上跳空缺口"],
+    ["相對強弱為正(強於大盤)", "回後買上漲全通過", "創52週新高"],
+    ["創52週新高", "均線多頭排列(5>20>60且站上月線)", "突破飆股大量黑K最高點剛形成"],
+    ["多方力道≥80", "近3日向上跳空缺口", "突破ABC修正下降切線剛形成"],
+    ["相對強弱為正(強於大盤)", "大盤站上20日均線", "創52週新高"],
+    ["創52週新高", "外資近5日買超", "DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR)"],
+    ["多方力道≥65", "大盤站上20日均線", "創52週新高"],
+    ["多方力道≥65", "量能區間高檔(≥90百分位)", "創52週新高"],
+    ["多方力道≥80", "大盤站上60日均線", "N字底剛形成"],
+    ["多方力道≥80", "創52週新高", "均線多頭排列(5>20>60且站上月線)"],
+    ["爆量(≥1.5倍均量)", "大盤站上20日均線", "創52週新高"],
+    ["量能區間高檔(≥90百分位)", "DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR)", "N字底剛形成"],
+    ["強勢突破盤", "創52週新高", "連續放量(近3日均量≥1.5倍前20日均量)"],
+    ["爆量(≥2倍均量)", "量能斜率轉強(近5日均量>近10日均量20%以上)", "創52週新高"],
+    ["地量(≤0.5倍均量)", "量能區間高檔(≥90百分位)", "DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR)"],
+    ["量能斜率轉弱(近5日均量<近10日均量20%以上)", "回後買上漲全通過", "創52週新高"],
+    ["相對強弱為正(強於大盤)", "創52週新高", "近3日向上跳空缺口"],
+    ["大盤站上20日均線", "外資近5日買超", "晨星剛形成"],
+    ["距52週高點≤5%", "突破ABC修正下降切線剛形成", "突破飆股大量黑K最高點剛形成"],
     ["量能斜率轉強(近5日均量>近10日均量20%以上)", "創52週新高", "突破飆股大量黑K最高點剛形成"],
-    ["大盤站上20日均線", "回後買上漲全通過", "距52週高點≤5%"],
-    ["大盤跌破20日均線", "創52週新高", "近3月均價YoY為負"],
-    ["大盤站上60日均線", "回後買上漲全通過", "距52週高點≤5%"],
-    ["大盤站上60日均線", "回後買上漲全通過", "母子懷抱(低檔)剛形成"],
-    ["大盤站上60日均線", "近3日向上跳空缺口", "母子懷抱(低檔)剛形成"],
-    ["回後買上漲全通過", "距52週高點≤5%", "N字底剛形成"],
+    ["回後買上漲全通過", "創52週新高", "距52週高點≤5%"],
+    ["回後買上漲全通過", "創52週新高", "連續放量(近3日均量≥1.5倍前20日均量)"],
+    ["相對強弱為正(強於大盤)", "距52週高點≤5%", "突破飆股大量黑K最高點剛形成"],
+    ["布林通道高檔(≥80%)", "創52週新高", "DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR)"],
+    ["KDJ近3日內黃金交叉", "創52週新高", "突破飆股大量黑K最高點剛形成"],
+    ["爆量(≥2倍均量)", "創52週新高", "DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR)"],
+    ["多方力道≥65", "爆量(≥2倍均量)", "創52週新高"],
+    ["多方力道≥65", "量能斜率轉強(近5日均量>近10日均量20%以上)", "創52週新高"],
+    ["多方力道≥80", "創52週新高", "三大法人近3月買超"],
+    ["多方力道≥65", "KDJ近3日內黃金交叉", "創52週新高"],
+    ["多方力道≥65", "爆量(≥1.5倍均量)", "創52週新高"],
+    ["多方力道≥80", "創52週新高", "距52週高點≤5%"],
+    ["回後買上漲全通過", "外資近5日買超", "DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR)"],
+    ["強勢突破盤", "地量(≤0.5倍均量)", "近3日向上跳空缺口"],
+
 ]
 BT_HOT_STATS = {
-    "地量(≤0.5倍均量) ＋ 創52週新高 ＋ 三大法人近3月賣超": {"10": {"n": 57, "moonshotN": 9, "pct": 15.8, "avg": 49.5}, "20": {"n": 57, "moonshotN": 16, "pct": 28.1, "avg": 51.2}},
-    "強勢突破盤 ＋ 地量(≤0.5倍均量) ＋ 創52週新高": {"10": {"n": 258, "moonshotN": 30, "pct": 11.6, "avg": 44.2}, "20": {"n": 257, "moonshotN": 54, "pct": 21.0, "avg": 53.8}},
-    "量能斜率轉弱(近5日均量<近10日均量20%以上) ＋ 距52週高點≤5% ＋ 晨星剛形成": {"10": {"n": 54, "moonshotN": 7, "pct": 13.0, "avg": 46.3}, "20": {"n": 54, "moonshotN": 11, "pct": 20.4, "avg": 44.5}},
-    "地量(≤0.5倍均量) ＋ 回後買上漲全通過 ＋ 創52週新高": {"10": {"n": 144, "moonshotN": 14, "pct": 9.7, "avg": 40.7}, "20": {"n": 144, "moonshotN": 29, "pct": 20.1, "avg": 58.7}},
-    "強勢突破盤 ＋ 地量(≤0.5倍均量) ＋ 近3日向上跳空缺口": {"10": {"n": 276, "moonshotN": 35, "pct": 12.7, "avg": 46.2}, "20": {"n": 275, "moonshotN": 55, "pct": 20.0, "avg": 57.2}},
+    "地量(≤0.5倍均量) ＋ 創52週新高 ＋ 三大法人近3月賣超": {"10": {"n": 60, "moonshotN": 9, "pct": 15.0, "avg": 49.5}, "20": {"n": 60, "moonshotN": 17, "pct": 28.3, "avg": 49.9}},
+    "量能斜率轉弱(近5日均量<近10日均量20%以上) ＋ 距52週高點≤5% ＋ 晨星剛形成": {"10": {"n": 53, "moonshotN": 7, "pct": 13.2, "avg": 46.8}, "20": {"n": 53, "moonshotN": 12, "pct": 22.6, "avg": 46.2}},
+    "創52週新高 ＋ DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR) ＋ 母子懷抱(低檔)剛形成": {"10": {"n": 62, "moonshotN": 6, "pct": 9.7, "avg": 49.6}, "20": {"n": 62, "moonshotN": 10, "pct": 16.1, "avg": 66.8}},
+    "均線多頭排列(5>20>60且站上月線) ＋ K線橫盤的突破剛形成 ＋ 母子懷抱(低檔)剛形成": {"10": {"n": 65, "moonshotN": 4, "pct": 6.2, "avg": 41.2}, "20": {"n": 65, "moonshotN": 10, "pct": 15.4, "avg": 45.0}},
+    "大盤站上60日均線 ＋ 創52週新高 ＋ 母子懷抱(低檔)剛形成": {"10": {"n": 92, "moonshotN": 8, "pct": 8.7, "avg": 47.2}, "20": {"n": 92, "moonshotN": 15, "pct": 16.3, "avg": 61.8}},
+    "量能斜率轉弱(近5日均量<近10日均量20%以上) ＋ DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR) ＋ 晨星剛形成": {"10": {"n": 154, "moonshotN": 13, "pct": 8.4, "avg": 45.2}, "20": {"n": 154, "moonshotN": 28, "pct": 18.2, "avg": 50.3}},
     "多方力道≥65 ＋ 量能區間低檔(≤10百分位) ＋ 創52週新高": {"10": {"n": 58, "moonshotN": 2, "pct": 3.4, "avg": 30.8}, "20": {"n": 58, "moonshotN": 11, "pct": 19.0, "avg": 44.4}},
-    "量能斜率轉弱(近5日均量<近10日均量20%以上) ＋ 創52週新高 ＋ 近3日向上跳空缺口": {"10": {"n": 434, "moonshotN": 40, "pct": 9.2, "avg": 43.7}, "20": {"n": 434, "moonshotN": 81, "pct": 18.7, "avg": 56.2}},
-    "地量(≤0.5倍均量) ＋ 回後買上漲全通過 ＋ 近3日向上跳空缺口": {"10": {"n": 140, "moonshotN": 16, "pct": 11.4, "avg": 40.2}, "20": {"n": 140, "moonshotN": 26, "pct": 18.6, "avg": 61.0}},
-    "多方力道≥65 ＋ 近3日向上跳空缺口 ＋ 母子懷抱(低檔)剛形成": {"10": {"n": 98, "moonshotN": 8, "pct": 8.2, "avg": 43.7}, "20": {"n": 98, "moonshotN": 18, "pct": 18.4, "avg": 59.1}},
-    "地量(≤0.5倍均量) ＋ 回後買上漲全通過 ＋ 距52週高點≤5%": {"10": {"n": 172, "moonshotN": 16, "pct": 9.3, "avg": 41.9}, "20": {"n": 172, "moonshotN": 31, "pct": 18.0, "avg": 59.6}},
-    "多方力道≥80 ＋ 地量(≤0.5倍均量) ＋ 創52週新高": {"10": {"n": 481, "moonshotN": 39, "pct": 8.1, "avg": 43.0}, "20": {"n": 481, "moonshotN": 85, "pct": 17.7, "avg": 53.7}},
-    "地量(≤0.5倍均量) ＋ 創52週新高 ＋ 近3月乖離度為負(股價超前營收)": {"10": {"n": 369, "moonshotN": 33, "pct": 8.9, "avg": 45.9}, "20": {"n": 369, "moonshotN": 65, "pct": 17.6, "avg": 54.0}},
-    "地量(≤0.5倍均量) ＋ 創52週新高 ＋ 近3月均價YoY為負": {"10": {"n": 111, "moonshotN": 5, "pct": 4.5, "avg": 45.0}, "20": {"n": 111, "moonshotN": 19, "pct": 17.1, "avg": 47.4}},
-    "創52週新高 ＋ 近3月乖離度為負(股價超前營收) ＋ 晨星剛形成": {"10": {"n": 88, "moonshotN": 7, "pct": 8.0, "avg": 43.0}, "20": {"n": 88, "moonshotN": 15, "pct": 17.0, "avg": 51.1}},
-    "量能區間低檔(≤10百分位) ＋ 創52週新高 ＋ 近3月乖離度為負(股價超前營收)": {"10": {"n": 65, "moonshotN": 3, "pct": 4.6, "avg": 31.4}, "20": {"n": 65, "moonshotN": 11, "pct": 16.9, "avg": 44.4}},
-    "多方力道≥80 ＋ 地量(≤0.5倍均量) ＋ 近3日向上跳空缺口": {"10": {"n": 784, "moonshotN": 71, "pct": 9.1, "avg": 43.6}, "20": {"n": 784, "moonshotN": 132, "pct": 16.8, "avg": 58.2}},
-    "KDJ近3日內死亡交叉 ＋ 地量(≤0.5倍均量) ＋ 創52週新高": {"10": {"n": 138, "moonshotN": 6, "pct": 4.3, "avg": 58.5}, "20": {"n": 138, "moonshotN": 23, "pct": 16.7, "avg": 52.2}},
-    "距52週高點≤5% ＋ 突破飆股大量黑K最高點剛形成 ＋ 晨星剛形成": {"10": {"n": 96, "moonshotN": 7, "pct": 7.3, "avg": 44.7}, "20": {"n": 96, "moonshotN": 16, "pct": 16.7, "avg": 53.8}},
-    "地量(≤0.5倍均量) ＋ 回後買上漲全通過 ＋ 均線多頭排列(5>20>60且站上月線)": {"10": {"n": 194, "moonshotN": 17, "pct": 8.8, "avg": 42.0}, "20": {"n": 194, "moonshotN": 32, "pct": 16.5, "avg": 59.2}},
-    "距52週高點≤5% ＋ K線橫盤的突破剛形成 ＋ 晨星剛形成": {"10": {"n": 109, "moonshotN": 10, "pct": 9.2, "avg": 40.8}, "20": {"n": 109, "moonshotN": 18, "pct": 16.5, "avg": 46.1}},
-    "地量(≤0.5倍均量) ＋ 量能斜率轉弱(近5日均量<近10日均量20%以上) ＋ 創52週新高": {"10": {"n": 337, "moonshotN": 25, "pct": 7.4, "avg": 43.1}, "20": {"n": 337, "moonshotN": 55, "pct": 16.3, "avg": 56.1}},
-    "地量(≤0.5倍均量) ＋ 大盤跌破20日均線 ＋ 創52週新高": {"10": {"n": 74, "moonshotN": 6, "pct": 8.1, "avg": 48.3}, "20": {"n": 74, "moonshotN": 12, "pct": 16.2, "avg": 71.5}},
-    "地量(≤0.5倍均量) ＋ 大盤站上60日均線 ＋ 創52週新高": {"10": {"n": 575, "moonshotN": 47, "pct": 8.2, "avg": 44.0}, "20": {"n": 574, "moonshotN": 93, "pct": 16.2, "avg": 53.8}},
-    "創52週新高 ＋ 近3月均價YoY為正 ＋ 母子懷抱(低檔)剛形成": {"10": {"n": 74, "moonshotN": 7, "pct": 9.5, "avg": 45.4}, "20": {"n": 74, "moonshotN": 12, "pct": 16.2, "avg": 61.5}},
-    "相對強弱為正(強於大盤) ＋ 地量(≤0.5倍均量) ＋ 創52週新高": {"10": {"n": 591, "moonshotN": 47, "pct": 8.0, "avg": 44.0}, "20": {"n": 591, "moonshotN": 95, "pct": 16.1, "avg": 53.5}},
-    "地量(≤0.5倍均量) ＋ 距52週高點≤5% ＋ 近3日向上跳空缺口": {"10": {"n": 567, "moonshotN": 49, "pct": 8.6, "avg": 44.7}, "20": {"n": 565, "moonshotN": 91, "pct": 16.1, "avg": 55.1}},
-    "量能區間低檔(≤10百分位) ＋ 距52週高點≤5% ＋ 近3日向上跳空缺口": {"10": {"n": 62, "moonshotN": 3, "pct": 4.8, "avg": 37.0}, "20": {"n": 62, "moonshotN": 10, "pct": 16.1, "avg": 49.8}},
-    "地量(≤0.5倍均量) ＋ 均線多頭排列(5>20>60且站上月線) ＋ 晨星剛形成": {"10": {"n": 81, "moonshotN": 7, "pct": 8.6, "avg": 37.7}, "20": {"n": 81, "moonshotN": 13, "pct": 16.0, "avg": 58.3}},
-    "創52週新高 ＋ 近3月均價YoY為正 ＋ 晨星剛形成": {"10": {"n": 125, "moonshotN": 10, "pct": 8.0, "avg": 40.8}, "20": {"n": 125, "moonshotN": 20, "pct": 16.0, "avg": 53.1}},
-    "布林通道高檔(≥80%) ＋ 地量(≤0.5倍均量) ＋ 創52週新高": {"10": {"n": 574, "moonshotN": 47, "pct": 8.2, "avg": 44.0}, "20": {"n": 573, "moonshotN": 91, "pct": 15.9, "avg": 53.8}},
-    "均線多頭排列(5>20>60且站上月線) ＋ 突破飆股大量黑K最高點剛形成 ＋ 晨星剛形成": {"10": {"n": 138, "moonshotN": 10, "pct": 7.2, "avg": 41.9}, "20": {"n": 138, "moonshotN": 22, "pct": 15.9, "avg": 55.5}},
-    "均線多頭排列(5>20>60且站上月線) ＋ K線橫盤的突破剛形成 ＋ 晨星剛形成": {"10": {"n": 151, "moonshotN": 13, "pct": 8.6, "avg": 42.9}, "20": {"n": 151, "moonshotN": 24, "pct": 15.9, "avg": 47.8}},
-    "爆量(≥1.5倍均量) ＋ 量能斜率轉弱(近5日均量<近10日均量20%以上) ＋ 創52週新高": {"10": {"n": 190, "moonshotN": 12, "pct": 6.3, "avg": 41.8}, "20": {"n": 190, "moonshotN": 30, "pct": 15.8, "avg": 48.6}},
-    "大盤站上60日均線 ＋ 創52週新高 ＋ 母子懷抱(低檔)剛形成": {"10": {"n": 95, "moonshotN": 8, "pct": 8.4, "avg": 47.2}, "20": {"n": 95, "moonshotN": 15, "pct": 15.8, "avg": 61.8}},
-    "多方力道≥65 ＋ 地量(≤0.5倍均量) ＋ 創52週新高": {"10": {"n": 573, "moonshotN": 45, "pct": 7.9, "avg": 43.8}, "20": {"n": 573, "moonshotN": 90, "pct": 15.7, "avg": 53.6}},
-    "創52週新高 ＋ 三大法人近3月買超 ＋ 母子懷抱(低檔)剛形成": {"10": {"n": 89, "moonshotN": 8, "pct": 9.0, "avg": 47.2}, "20": {"n": 89, "moonshotN": 14, "pct": 15.7, "avg": 63.8}},
-    "地量(≤0.5倍均量) ＋ 創52週新高": {"10": {"n": 611, "moonshotN": 47, "pct": 7.7, "avg": 44.0}, "20": {"n": 610, "moonshotN": 95, "pct": 15.6, "avg": 53.5}},
-    "多方力道≥65 ＋ 創52週新高 ＋ 母子懷抱(低檔)剛形成": {"10": {"n": 77, "moonshotN": 8, "pct": 10.4, "avg": 47.2}, "20": {"n": 77, "moonshotN": 12, "pct": 15.6, "avg": 66.5}},
-    "KDJ近3日內黃金交叉 ＋ 地量(≤0.5倍均量) ＋ 創52週新高": {"10": {"n": 257, "moonshotN": 18, "pct": 7.0, "avg": 42.1}, "20": {"n": 257, "moonshotN": 40, "pct": 15.6, "avg": 57.3}},
-    "爆量(≥2倍均量) ＋ 量能斜率轉弱(近5日均量<近10日均量20%以上) ＋ 創52週新高": {"10": {"n": 77, "moonshotN": 4, "pct": 5.2, "avg": 40.7}, "20": {"n": 77, "moonshotN": 12, "pct": 15.6, "avg": 50.0}},
-    "地量(≤0.5倍均量) ＋ 創52週新高 ＋ 均線多頭排列(5>20>60且站上月線)": {"10": {"n": 610, "moonshotN": 47, "pct": 7.7, "avg": 44.0}, "20": {"n": 609, "moonshotN": 95, "pct": 15.6, "avg": 53.5}},
-    "量能斜率轉弱(近5日均量<近10日均量20%以上) ＋ 創52週新高 ＋ 近3月均價YoY為負": {"10": {"n": 269, "moonshotN": 14, "pct": 5.2, "avg": 43.6}, "20": {"n": 269, "moonshotN": 42, "pct": 15.6, "avg": 42.7}},
-    "布林通道高檔(≥80%) ＋ 量能區間低檔(≤10百分位) ＋ 創52週新高": {"10": {"n": 71, "moonshotN": 4, "pct": 5.6, "avg": 31.2}, "20": {"n": 71, "moonshotN": 11, "pct": 15.5, "avg": 44.4}},
-    "相對強弱為正(強於大盤) ＋ 創52週新高 ＋ 母子懷抱(低檔)剛形成": {"10": {"n": 97, "moonshotN": 8, "pct": 8.2, "avg": 47.2}, "20": {"n": 97, "moonshotN": 15, "pct": 15.5, "avg": 61.8}},
-    "地量(≤0.5倍均量) ＋ 大盤站上20日均線 ＋ 創52週新高": {"10": {"n": 537, "moonshotN": 41, "pct": 7.6, "avg": 43.4}, "20": {"n": 536, "moonshotN": 83, "pct": 15.5, "avg": 50.9}},
-    "地量(≤0.5倍均量) ＋ 均線多頭排列(5>20>60且站上月線) ＋ 夜星剛形成": {"10": {"n": 65, "moonshotN": 11, "pct": 16.9, "avg": 39.3}, "20": {"n": 65, "moonshotN": 10, "pct": 15.4, "avg": 69.8}},
+    "大盤站上20日均線 ＋ 創52週新高 ＋ 母子懷抱(低檔)剛形成": {"10": {"n": 86, "moonshotN": 6, "pct": 7.0, "avg": 41.6}, "20": {"n": 86, "moonshotN": 12, "pct": 14.0, "avg": 57.2}},
+    "大盤跌破60日均線 ＋ DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR) ＋ 晨星剛形成": {"10": {"n": 81, "moonshotN": 5, "pct": 6.2, "avg": 41.3}, "20": {"n": 81, "moonshotN": 11, "pct": 13.6, "avg": 44.2}},
+    "DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR) ＋ K線橫盤的突破剛形成 ＋ 晨星剛形成": {"10": {"n": 94, "moonshotN": 8, "pct": 8.5, "avg": 46.9}, "20": {"n": 94, "moonshotN": 13, "pct": 13.8, "avg": 51.5}},
+    "均線多頭排列(5>20>60且站上月線) ＋ K線橫盤的突破剛形成 ＋ 晨星剛形成": {"10": {"n": 148, "moonshotN": 14, "pct": 9.5, "avg": 43.2}, "20": {"n": 148, "moonshotN": 25, "pct": 16.9, "avg": 47.5}},
+    "多方力道≥80 ＋ 地量(≤0.5倍均量) ＋ 創52週新高": {"10": {"n": 491, "moonshotN": 42, "pct": 8.6, "avg": 43.1}, "20": {"n": 491, "moonshotN": 93, "pct": 18.9, "avg": 53.3}},
+    "距52週高點≤5% ＋ K線橫盤的突破剛形成 ＋ 晨星剛形成": {"10": {"n": 105, "moonshotN": 11, "pct": 10.5, "avg": 41.4}, "20": {"n": 105, "moonshotN": 19, "pct": 18.1, "avg": 45.8}},
+    "地量(≤0.5倍均量) ＋ 回後買上漲全通過 ＋ 創52週新高": {"10": {"n": 146, "moonshotN": 15, "pct": 10.3, "avg": 40.8}, "20": {"n": 146, "moonshotN": 30, "pct": 20.5, "avg": 58.1}},
+    "布林通道高檔(≥80%) ＋ 量能區間低檔(≤10百分位) ＋ 創52週新高": {"10": {"n": 70, "moonshotN": 4, "pct": 5.7, "avg": 31.2}, "20": {"n": 70, "moonshotN": 11, "pct": 15.7, "avg": 44.4}},
+    "地量(≤0.5倍均量) ＋ 距52週高點≤5% ＋ 突破ABC修正下降切線剛形成": {"10": {"n": 74, "moonshotN": 6, "pct": 8.1, "avg": 46.2}, "20": {"n": 74, "moonshotN": 10, "pct": 13.5, "avg": 59.4}},
+    "地量(≤0.5倍均量) ＋ 創52週新高 ＋ DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR)": {"10": {"n": 503, "moonshotN": 43, "pct": 8.5, "avg": 43.1}, "20": {"n": 503, "moonshotN": 95, "pct": 18.9, "avg": 53.1}},
+    "量能斜率轉弱(近5日均量<近10日均量20%以上) ＋ 均線多頭排列(5>20>60且站上月線) ＋ 晨星剛形成": {"10": {"n": 197, "moonshotN": 15, "pct": 7.6, "avg": 46.8}, "20": {"n": 197, "moonshotN": 31, "pct": 15.7, "avg": 50.6}},
+    "地量(≤0.5倍均量) ＋ 量能區間高檔(≥90百分位) ＋ 距52週高點≤5%": {"10": {"n": 119, "moonshotN": 8, "pct": 6.7, "avg": 51.5}, "20": {"n": 119, "moonshotN": 24, "pct": 20.2, "avg": 41.8}},
+    "量能斜率轉弱(近5日均量<近10日均量20%以上) ＋ 創52週新高 ＋ 近3日向上跳空缺口": {"10": {"n": 436, "moonshotN": 41, "pct": 9.4, "avg": 44.0}, "20": {"n": 436, "moonshotN": 82, "pct": 18.8, "avg": 56.0}},
+    "多方力道≥80 ＋ 距52週高點≤5% ＋ 晨星剛形成": {"10": {"n": 208, "moonshotN": 18, "pct": 8.7, "avg": 46.8}, "20": {"n": 208, "moonshotN": 33, "pct": 15.9, "avg": 50.7}},
+    "大盤跌破60日均線 ＋ 外資近5日買超 ＋ 夜星剛形成": {"10": {"n": 85, "moonshotN": 8, "pct": 9.4, "avg": 44.8}, "20": {"n": 85, "moonshotN": 13, "pct": 15.3, "avg": 60.3}},
+    "距52週高點≤5% ＋ 近3月均價YoY為正 ＋ 晨星剛形成": {"10": {"n": 284, "moonshotN": 25, "pct": 8.8, "avg": 45.9}, "20": {"n": 284, "moonshotN": 43, "pct": 15.1, "avg": 51.2}},
+    "創52週新高 ＋ 近3月乖離度為正(營收優於股價) ＋ N字底剛形成": {"10": {"n": 344, "moonshotN": 19, "pct": 5.5, "avg": 44.0}, "20": {"n": 344, "moonshotN": 41, "pct": 11.9, "avg": 49.2}},
+    "大盤站上20日均線 ＋ 距52週高點≤5% ＋ 晨星剛形成": {"10": {"n": 329, "moonshotN": 25, "pct": 7.6, "avg": 44.7}, "20": {"n": 329, "moonshotN": 48, "pct": 14.6, "avg": 50.0}},
+    "創52週新高 ＋ 近3日向上跳空缺口 ＋ 三大法人近3月賣超": {"10": {"n": 997, "moonshotN": 78, "pct": 7.8, "avg": 45.3}, "20": {"n": 997, "moonshotN": 116, "pct": 11.6, "avg": 52.8}},
+    "相對強弱為正(強於大盤) ＋ 地量(≤0.5倍均量) ＋ 創52週新高": {"10": {"n": 598, "moonshotN": 50, "pct": 8.4, "avg": 44.0}, "20": {"n": 598, "moonshotN": 103, "pct": 17.2, "avg": 53.3}},
+    "地量(≤0.5倍均量) ＋ 大盤站上20日均線 ＋ 創52週新高": {"10": {"n": 541, "moonshotN": 44, "pct": 8.1, "avg": 43.4}, "20": {"n": 541, "moonshotN": 90, "pct": 16.6, "avg": 51.1}},
+    "創52週新高 ＋ 近3日向上跳空缺口 ＋ 突破ABC修正下降切線剛形成": {"10": {"n": 352, "moonshotN": 29, "pct": 8.2, "avg": 43.1}, "20": {"n": 352, "moonshotN": 45, "pct": 12.8, "avg": 54.4}},
+    "距52週高點≤5% ＋ 突破飆股大量黑K最高點剛形成 ＋ 晨星剛形成": {"10": {"n": 91, "moonshotN": 7, "pct": 7.7, "avg": 44.7}, "20": {"n": 91, "moonshotN": 16, "pct": 17.6, "avg": 53.8}},
+    "爆量(≥2倍均量) ＋ 量能斜率轉弱(近5日均量<近10日均量20%以上) ＋ 創52週新高": {"10": {"n": 71, "moonshotN": 5, "pct": 7.0, "avg": 43.6}, "20": {"n": 71, "moonshotN": 12, "pct": 16.9, "avg": 49.0}},
     "量能區間低檔(≤10百分位) ＋ 大盤站上60日均線 ＋ 創52週新高": {"10": {"n": 72, "moonshotN": 4, "pct": 5.6, "avg": 31.2}, "20": {"n": 72, "moonshotN": 11, "pct": 15.3, "avg": 44.4}},
-    "均線多頭排列(5>20>60且站上月線) ＋ 突破飆股大量黑K最高點剛形成 ＋ 母子懷抱(低檔)剛形成": {"10": {"n": 85, "moonshotN": 6, "pct": 7.1, "avg": 38.9}, "20": {"n": 85, "moonshotN": 13, "pct": 15.3, "avg": 50.4}},
-    "多方力道≥80 ＋ 創52週新高 ＋ 晨星剛形成": {"10": {"n": 105, "moonshotN": 10, "pct": 9.5, "avg": 39.5}, "20": {"n": 105, "moonshotN": 16, "pct": 15.2, "avg": 50.4}},
-    "地量(≤0.5倍均量) ＋ 創52週新高 ＋ 近3月均價YoY為正": {"10": {"n": 500, "moonshotN": 42, "pct": 8.4, "avg": 43.9}, "20": {"n": 499, "moonshotN": 76, "pct": 15.2, "avg": 55.0}},
-    "量能斜率轉弱(近5日均量<近10日均量20%以上) ＋ 均線多頭排列(5>20>60且站上月線) ＋ 晨星剛形成": {"10": {"n": 198, "moonshotN": 14, "pct": 7.1, "avg": 47.2}, "20": {"n": 198, "moonshotN": 30, "pct": 15.2, "avg": 50.3}},
-    "布林通道高檔(≥80%) ＋ 地量(≤0.5倍均量) ＋ 近3日向上跳空缺口": {"10": {"n": 796, "moonshotN": 65, "pct": 8.2, "avg": 45.9}, "20": {"n": 795, "moonshotN": 120, "pct": 15.1, "avg": 55.5}},
-    "布林通道高檔(≥80%) ＋ 創52週新高 ＋ 母子懷抱(低檔)剛形成": {"10": {"n": 100, "moonshotN": 8, "pct": 8.0, "avg": 47.2}, "20": {"n": 100, "moonshotN": 15, "pct": 15.0, "avg": 61.8}},
-    "地量(≤0.5倍均量) ＋ 創52週新高 ＋ 距52週高點≤5%": {"10": {"n": 553, "moonshotN": 44, "pct": 8.0, "avg": 42.4}, "20": {"n": 552, "moonshotN": 83, "pct": 15.0, "avg": 52.6}},
-    "大盤站上60日均線 ＋ 創52週新高 ＋ 晨星剛形成": {"10": {"n": 153, "moonshotN": 11, "pct": 7.2, "avg": 40.5}, "20": {"n": 153, "moonshotN": 23, "pct": 15.0, "avg": 51.8}},
-    "創52週新高 ＋ 母子懷抱(低檔)剛形成": {"10": {"n": 101, "moonshotN": 8, "pct": 7.9, "avg": 47.2}, "20": {"n": 101, "moonshotN": 15, "pct": 14.9, "avg": 61.8}},
-    "布林通道高檔(≥80%) ＋ 近3日向上跳空缺口 ＋ 母子懷抱(低檔)剛形成": {"10": {"n": 109, "moonshotN": 10, "pct": 9.2, "avg": 43.4}, "20": {"n": 109, "moonshotN": 16, "pct": 14.7, "avg": 58.1}},
     "相對強弱為正(強於大盤) ＋ 量能區間低檔(≤10百分位) ＋ 創52週新高": {"10": {"n": 75, "moonshotN": 4, "pct": 5.3, "avg": 31.2}, "20": {"n": 75, "moonshotN": 11, "pct": 14.7, "avg": 44.4}},
-    "大盤站上60日均線 ＋ 距52週高點≤5% ＋ 晨星剛形成": {"10": {"n": 365, "moonshotN": 29, "pct": 7.9, "avg": 44.9}, "20": {"n": 365, "moonshotN": 53, "pct": 14.5, "avg": 49.8}},
-    "距52週高點≤5% ＋ 近3月乖離度為負(股價超前營收) ＋ 晨星剛形成": {"10": {"n": 220, "moonshotN": 17, "pct": 7.7, "avg": 46.3}, "20": {"n": 220, "moonshotN": 32, "pct": 14.5, "avg": 49.6}},
-    "距52週高點≤5% ＋ 近3月均價YoY為正 ＋ 晨星剛形成": {"10": {"n": 296, "moonshotN": 26, "pct": 8.8, "avg": 45.3}, "20": {"n": 296, "moonshotN": 43, "pct": 14.5, "avg": 51.2}},
-    "多方力道≥80 ＋ 均線多頭排列(5>20>60且站上月線) ＋ 晨星剛形成": {"10": {"n": 425, "moonshotN": 32, "pct": 7.5, "avg": 43.1}, "20": {"n": 425, "moonshotN": 61, "pct": 14.4, "avg": 52.3}},
-    "地量(≤0.5倍均量) ＋ 量能斜率轉強(近5日均量>近10日均量20%以上) ＋ 創52週新高": {"10": {"n": 71, "moonshotN": 7, "pct": 9.9, "avg": 48.0}, "20": {"n": 70, "moonshotN": 10, "pct": 14.3, "avg": 59.1}},
-    "地量(≤0.5倍均量) ＋ 創52週新高 ＋ 三大法人近3月買超": {"10": {"n": 554, "moonshotN": 38, "pct": 6.9, "avg": 42.7}, "20": {"n": 553, "moonshotN": 79, "pct": 14.3, "avg": 54.0}},
-    "創52週新高 ＋ 突破飆股大量黑K最高點剛形成 ＋ 晨星剛形成": {"10": {"n": 70, "moonshotN": 5, "pct": 7.1, "avg": 46.2}, "20": {"n": 70, "moonshotN": 10, "pct": 14.3, "avg": 59.9}},
-    "多方力道≥80 ＋ 距52週高點≤5% ＋ 晨星剛形成": {"10": {"n": 219, "moonshotN": 17, "pct": 7.8, "avg": 46.5}, "20": {"n": 219, "moonshotN": 31, "pct": 14.2, "avg": 50.6}},
-    "強勢突破盤 ＋ 地量(≤0.5倍均量) ＋ 距52週高點≤5%": {"10": {"n": 438, "moonshotN": 34, "pct": 7.8, "avg": 46.4}, "20": {"n": 436, "moonshotN": 62, "pct": 14.2, "avg": 54.3}},
-    "量能區間低檔(≤10百分位) ＋ 創52週新高": {"10": {"n": 78, "moonshotN": 4, "pct": 5.1, "avg": 31.2}, "20": {"n": 78, "moonshotN": 11, "pct": 14.1, "avg": 44.4}},
-    "多方力道≥80 ＋ 量能斜率轉弱(近5日均量<近10日均量20%以上) ＋ 近3日向上跳空缺口": {"10": {"n": 1106, "moonshotN": 84, "pct": 7.6, "avg": 42.3}, "20": {"n": 1106, "moonshotN": 156, "pct": 14.1, "avg": 57.1}},
-    "大盤站上20日均線 ＋ 創52週新高 ＋ 晨星剛形成": {"10": {"n": 149, "moonshotN": 10, "pct": 6.7, "avg": 39.5}, "20": {"n": 149, "moonshotN": 21, "pct": 14.1, "avg": 50.2}},
-    "創52週新高 ＋ 近3日向上跳空缺口 ＋ N字底剛形成": {"10": {"n": 227, "moonshotN": 22, "pct": 9.7, "avg": 42.6}, "20": {"n": 227, "moonshotN": 32, "pct": 14.1, "avg": 53.1}},
-    "相對強弱為正(強於大盤) ＋ 創52週新高 ＋ 晨星剛形成": {"10": {"n": 166, "moonshotN": 11, "pct": 6.6, "avg": 40.5}, "20": {"n": 166, "moonshotN": 23, "pct": 13.9, "avg": 51.8}},
-    "爆量(≥2倍均量) ＋ 創52週新高 ＋ 晨星剛形成": {"10": {"n": 72, "moonshotN": 6, "pct": 8.3, "avg": 42.5}, "20": {"n": 72, "moonshotN": 10, "pct": 13.9, "avg": 59.6}},
-    "回後買上漲全通過 ＋ 創52週新高 ＋ 近3日向上跳空缺口": {"10": {"n": 1619, "moonshotN": 113, "pct": 7.0, "avg": 43.8}, "20": {"n": 1619, "moonshotN": 224, "pct": 13.8, "avg": 52.0}},
-    "相對強弱為正(強於大盤) ＋ 距52週高點≤5% ＋ 晨星剛形成": {"10": {"n": 379, "moonshotN": 28, "pct": 7.4, "avg": 45.2}, "20": {"n": 379, "moonshotN": 52, "pct": 13.7, "avg": 50.8}},
-    "量能區間低檔(≤10百分位) ＋ 創52週新高 ＋ 距52週高點≤5%": {"10": {"n": 73, "moonshotN": 4, "pct": 5.5, "avg": 31.2}, "20": {"n": 73, "moonshotN": 10, "pct": 13.7, "avg": 44.1}},
-    "大盤站上20日均線 ＋ 距52週高點≤5% ＋ 晨星剛形成": {"10": {"n": 344, "moonshotN": 25, "pct": 7.3, "avg": 44.5}, "20": {"n": 344, "moonshotN": 47, "pct": 13.7, "avg": 49.7}},
-    "大盤跌破20日均線 ＋ 均線多頭排列(5>20>60且站上月線) ＋ 夜星剛形成": {"10": {"n": 212, "moonshotN": 13, "pct": 6.1, "avg": 43.4}, "20": {"n": 212, "moonshotN": 29, "pct": 13.7, "avg": 57.8}},
-    "地量(≤0.5倍均量) ＋ 均線多頭排列(5>20>60且站上月線) ＋ 近3日向上跳空缺口": {"10": {"n": 1307, "moonshotN": 96, "pct": 7.3, "avg": 44.8}, "20": {"n": 1306, "moonshotN": 178, "pct": 13.6, "avg": 56.8}},
-    "量能斜率轉強(近5日均量>近10日均量20%以上) ＋ 距52週高點≤5% ＋ 晨星剛形成": {"10": {"n": 176, "moonshotN": 12, "pct": 6.8, "avg": 44.6}, "20": {"n": 176, "moonshotN": 24, "pct": 13.6, "avg": 51.0}},
-    "量能斜率轉弱(近5日均量<近10日均量20%以上) ＋ 回後買上漲全通過 ＋ 創52週新高": {"10": {"n": 376, "moonshotN": 25, "pct": 6.6, "avg": 41.6}, "20": {"n": 376, "moonshotN": 51, "pct": 13.6, "avg": 55.4}},
-    "大盤站上20日均線 ＋ 創52週新高 ＋ 母子懷抱(低檔)剛形成": {"10": {"n": 88, "moonshotN": 6, "pct": 6.8, "avg": 41.6}, "20": {"n": 88, "moonshotN": 12, "pct": 13.6, "avg": 57.2}},
-    "距52週高點≤5% ＋ 三大法人近3月買超 ＋ 晨星剛形成": {"10": {"n": 338, "moonshotN": 26, "pct": 7.7, "avg": 45.8}, "20": {"n": 338, "moonshotN": 46, "pct": 13.6, "avg": 48.4}},
-    "KDJ近3日內黃金交叉 ＋ 創52週新高 ＋ 晨星剛形成": {"10": {"n": 96, "moonshotN": 8, "pct": 8.3, "avg": 41.1}, "20": {"n": 96, "moonshotN": 13, "pct": 13.5, "avg": 58.8}},
+    "MACD近3日內黃金交叉 ＋ 均線多頭排列(5>20>60且站上月線) ＋ 母子懷抱(低檔)剛形成": {"10": {"n": 90, "moonshotN": 3, "pct": 3.3, "avg": 45.9}, "20": {"n": 90, "moonshotN": 11, "pct": 12.2, "avg": 48.9}},
+    "量能斜率轉弱(近5日均量<近10日均量20%以上) ＋ 距52週高點≤5% ＋ K線橫盤的突破剛形成": {"10": {"n": 125, "moonshotN": 10, "pct": 8.0, "avg": 41.9}, "20": {"n": 125, "moonshotN": 15, "pct": 12.0, "avg": 47.3}},
+    "距52週高點≤5% ＋ DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR) ＋ 晨星剛形成": {"10": {"n": 240, "moonshotN": 19, "pct": 7.9, "avg": 47.3}, "20": {"n": 240, "moonshotN": 34, "pct": 14.2, "avg": 50.4}},
+    "多方力道≥80 ＋ 創52週新高 ＋ N字底剛形成": {"10": {"n": 581, "moonshotN": 41, "pct": 7.1, "avg": 42.2}, "20": {"n": 581, "moonshotN": 72, "pct": 12.4, "avg": 49.6}},
+    "大盤站上60日均線 ＋ 距52週高點≤5% ＋ 晨星剛形成": {"10": {"n": 346, "moonshotN": 28, "pct": 8.1, "avg": 45.5}, "20": {"n": 346, "moonshotN": 53, "pct": 15.3, "avg": 49.8}},
+    "創52週新高 ＋ DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR) ＋ 突破ABC修正下降切線剛形成": {"10": {"n": 528, "moonshotN": 40, "pct": 7.6, "avg": 46.4}, "20": {"n": 528, "moonshotN": 67, "pct": 12.7, "avg": 53.9}},
+    "回後買上漲全通過 ＋ 創52週新高 ＋ 近3月乖離度為正(營收優於股價)": {"10": {"n": 1756, "moonshotN": 111, "pct": 6.3, "avg": 42.5}, "20": {"n": 1756, "moonshotN": 190, "pct": 10.8, "avg": 49.5}},
+    "多方力道≥80 ＋ 創52週新高 ＋ 突破ABC修正下降切線剛形成": {"10": {"n": 463, "moonshotN": 35, "pct": 7.6, "avg": 44.2}, "20": {"n": 463, "moonshotN": 53, "pct": 11.4, "avg": 55.0}},
+    "KDJ近3日內死亡交叉 ＋ 創52週新高 ＋ 近3月乖離度為正(營收優於股價)": {"10": {"n": 1233, "moonshotN": 49, "pct": 4.0, "avg": 45.3}, "20": {"n": 1233, "moonshotN": 130, "pct": 10.5, "avg": 50.4}},
+    "強勢突破盤 ＋ 地量(≤0.5倍均量) ＋ 連續放量(近3日均量≥1.5倍前20日均量)": {"10": {"n": 80, "moonshotN": 8, "pct": 10.0, "avg": 59.8}, "20": {"n": 80, "moonshotN": 15, "pct": 18.8, "avg": 65.1}},
+    "地量(≤0.5倍均量) ＋ 回後買上漲全通過 ＋ 距52週高點≤5%": {"10": {"n": 175, "moonshotN": 17, "pct": 9.7, "avg": 41.9}, "20": {"n": 175, "moonshotN": 32, "pct": 18.3, "avg": 59.0}},
+    "多方力道≥65 ＋ 地量(≤0.5倍均量) ＋ 創52週新高": {"10": {"n": 580, "moonshotN": 48, "pct": 8.3, "avg": 43.8}, "20": {"n": 580, "moonshotN": 98, "pct": 16.9, "avg": 53.4}},
+    "地量(≤0.5倍均量) ＋ 創52週新高 ＋ 均線多頭排列(5>20>60且站上月線)": {"10": {"n": 616, "moonshotN": 50, "pct": 8.1, "avg": 44.0}, "20": {"n": 616, "moonshotN": 103, "pct": 16.7, "avg": 53.3}},
+    "地量(≤0.5倍均量) ＋ 創52週新高": {"10": {"n": 618, "moonshotN": 50, "pct": 8.1, "avg": 44.0}, "20": {"n": 618, "moonshotN": 103, "pct": 16.7, "avg": 53.3}},
+    "連續放量(近3日均量≥1.5倍前20日均量) ＋ 突破飆股大量黑K最高點剛形成 ＋ 晨星剛形成": {"10": {"n": 152, "moonshotN": 11, "pct": 7.2, "avg": 40.8}, "20": {"n": 152, "moonshotN": 24, "pct": 15.8, "avg": 54.8}},
+    "地量(≤0.5倍均量) ＋ 量能斜率轉弱(近5日均量<近10日均量20%以上) ＋ 創52週新高": {"10": {"n": 344, "moonshotN": 27, "pct": 7.8, "avg": 43.4}, "20": {"n": 344, "moonshotN": 59, "pct": 17.2, "avg": 55.9}},
+    "外資近5日買超 ＋ K線橫盤的突破剛形成 ＋ 晨星剛形成": {"10": {"n": 129, "moonshotN": 12, "pct": 9.3, "avg": 45.2}, "20": {"n": 129, "moonshotN": 20, "pct": 15.5, "avg": 47.9}},
+    "創52週新高 ＋ 連續放量(近3日均量≥1.5倍前20日均量) ＋ 突破ABC修正下降切線剛形成": {"10": {"n": 564, "moonshotN": 36, "pct": 6.4, "avg": 46.5}, "20": {"n": 564, "moonshotN": 65, "pct": 11.5, "avg": 50.5}},
+    "回後買上漲全通過 ＋ 創52週新高 ＋ 三大法人近3月賣超": {"10": {"n": 575, "moonshotN": 39, "pct": 6.8, "avg": 43.0}, "20": {"n": 575, "moonshotN": 61, "pct": 10.6, "avg": 46.3}},
+    "布林通道高檔(≥80%) ＋ 地量(≤0.5倍均量) ＋ 創52週新高": {"10": {"n": 582, "moonshotN": 50, "pct": 8.6, "avg": 44.0}, "20": {"n": 582, "moonshotN": 99, "pct": 17.0, "avg": 53.5}},
+    "地量(≤0.5倍均量) ＋ 創52週新高 ＋ 距52週高點≤5%": {"10": {"n": 556, "moonshotN": 47, "pct": 8.5, "avg": 42.5}, "20": {"n": 556, "moonshotN": 90, "pct": 16.2, "avg": 52.2}},
+    "均線多頭排列(5>20>60且站上月線) ＋ 突破飆股大量黑K最高點剛形成 ＋ 晨星剛形成": {"10": {"n": 138, "moonshotN": 10, "pct": 7.2, "avg": 41.9}, "20": {"n": 138, "moonshotN": 22, "pct": 15.9, "avg": 55.5}},
+    "強勢突破盤 ＋ 地量(≤0.5倍均量) ＋ DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR)": {"10": {"n": 360, "moonshotN": 35, "pct": 9.7, "avg": 46.1}, "20": {"n": 360, "moonshotN": 72, "pct": 20.0, "avg": 54.8}},
+    "多方力道≥80 ＋ 均線多頭排列(5>20>60且站上月線) ＋ 晨星剛形成": {"10": {"n": 412, "moonshotN": 33, "pct": 8.0, "avg": 43.3}, "20": {"n": 412, "moonshotN": 63, "pct": 15.3, "avg": 52.2}},
+    "三大法人近3月買超 ＋ DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR) ＋ 晨星剛形成": {"10": {"n": 388, "moonshotN": 31, "pct": 8.0, "avg": 44.7}, "20": {"n": 388, "moonshotN": 58, "pct": 14.9, "avg": 51.9}},
+    "距52週高點≤5% ＋ 均線多頭排列(5>20>60且站上月線) ＋ 晨星剛形成": {"10": {"n": 373, "moonshotN": 29, "pct": 7.8, "avg": 45.5}, "20": {"n": 373, "moonshotN": 54, "pct": 14.5, "avg": 50.1}},
+    "地量(≤0.5倍均量) ＋ 距52週高點≤5% ＋ 近3日向上跳空缺口": {"10": {"n": 558, "moonshotN": 51, "pct": 9.1, "avg": 44.3}, "20": {"n": 558, "moonshotN": 92, "pct": 16.5, "avg": 55.6}},
+    "地量(≤0.5倍均量) ＋ 量能斜率轉強(近5日均量>近10日均量20%以上) ＋ 創52週新高": {"10": {"n": 69, "moonshotN": 8, "pct": 11.6, "avg": 46.6}, "20": {"n": 69, "moonshotN": 11, "pct": 15.9, "avg": 58.6}},
+    "創52週新高 ＋ 三大法人近3月買超 ＋ 母子懷抱(低檔)剛形成": {"10": {"n": 88, "moonshotN": 8, "pct": 9.1, "avg": 47.2}, "20": {"n": 88, "moonshotN": 14, "pct": 15.9, "avg": 63.8}},
+    "連續放量(近3日均量≥1.5倍前20日均量) ＋ K線橫盤的突破剛形成 ＋ 晨星剛形成": {"10": {"n": 132, "moonshotN": 11, "pct": 8.3, "avg": 42.0}, "20": {"n": 132, "moonshotN": 21, "pct": 15.9, "avg": 45.1}},
+    "多方力道≥65 ＋ 創52週新高 ＋ 母子懷抱(低檔)剛形成": {"10": {"n": 77, "moonshotN": 8, "pct": 10.4, "avg": 47.2}, "20": {"n": 77, "moonshotN": 12, "pct": 15.6, "avg": 66.5}},
+    "布林通道高檔(≥80%) ＋ 創52週新高 ＋ 母子懷抱(低檔)剛形成": {"10": {"n": 99, "moonshotN": 8, "pct": 8.1, "avg": 47.2}, "20": {"n": 99, "moonshotN": 15, "pct": 15.2, "avg": 61.8}},
+    "量能斜率轉強(近5日均量>近10日均量20%以上) ＋ 距52週高點≤5% ＋ 晨星剛形成": {"10": {"n": 170, "moonshotN": 13, "pct": 7.6, "avg": 44.8}, "20": {"n": 170, "moonshotN": 25, "pct": 14.7, "avg": 50.6}},
+    "距52週高點≤5% ＋ 連續放量(近3日均量≥1.5倍前20日均量) ＋ 晨星剛形成": {"10": {"n": 172, "moonshotN": 13, "pct": 7.6, "avg": 48.5}, "20": {"n": 172, "moonshotN": 24, "pct": 14.0, "avg": 51.4}},
     "量能區間低檔(≤10百分位) ＋ 創52週新高 ＋ 三大法人近3月買超": {"10": {"n": 74, "moonshotN": 4, "pct": 5.4, "avg": 31.2}, "20": {"n": 74, "moonshotN": 10, "pct": 13.5, "avg": 43.0}},
-    "創52週新高 ＋ 均線多頭排列(5>20>60且站上月線) ＋ 晨星剛形成": {"10": {"n": 170, "moonshotN": 11, "pct": 6.5, "avg": 40.5}, "20": {"n": 170, "moonshotN": 23, "pct": 13.5, "avg": 51.8}},
-    "距52週高點≤5% ＋ 均線多頭排列(5>20>60且站上月線) ＋ 晨星剛形成": {"10": {"n": 386, "moonshotN": 28, "pct": 7.3, "avg": 45.3}, "20": {"n": 386, "moonshotN": 52, "pct": 13.5, "avg": 50.0}},
-    "創52週新高 ＋ 晨星剛形成": {"10": {"n": 172, "moonshotN": 11, "pct": 6.4, "avg": 40.5}, "20": {"n": 172, "moonshotN": 23, "pct": 13.4, "avg": 51.8}},
-    "布林通道高檔(≥80%) ＋ 距52週高點≤5% ＋ 晨星剛形成": {"10": {"n": 382, "moonshotN": 27, "pct": 7.1, "avg": 44.2}, "20": {"n": 382, "moonshotN": 51, "pct": 13.4, "avg": 50.2}},
-    "量能斜率轉弱(近5日均量<近10日均量20%以上) ＋ 回後買上漲全通過 ＋ 近3日向上跳空缺口": {"10": {"n": 306, "moonshotN": 25, "pct": 8.2, "avg": 42.0}, "20": {"n": 306, "moonshotN": 41, "pct": 13.4, "avg": 56.0}},
-    "多方力道≥65 ＋ 創52週新高 ＋ 晨星剛形成": {"10": {"n": 135, "moonshotN": 11, "pct": 8.1, "avg": 40.5}, "20": {"n": 135, "moonshotN": 18, "pct": 13.3, "avg": 50.8}},
-    "創52週新高 ＋ 三大法人近3月賣超 ＋ 突破飆股大量黑K最高點剛形成": {"10": {"n": 173, "moonshotN": 14, "pct": 8.1, "avg": 47.7}, "20": {"n": 173, "moonshotN": 23, "pct": 13.3, "avg": 57.8}},
-    "均線多頭排列(5>20>60且站上月線) ＋ 近3月乖離度為負(股價超前營收) ＋ 晨星剛形成": {"10": {"n": 480, "moonshotN": 36, "pct": 7.5, "avg": 44.4}, "20": {"n": 480, "moonshotN": 64, "pct": 13.3, "avg": 52.9}},
-    "距52週高點≤5% ＋ 晨星剛形成": {"10": {"n": 408, "moonshotN": 29, "pct": 7.1, "avg": 44.9}, "20": {"n": 408, "moonshotN": 54, "pct": 13.2, "avg": 50.1}},
-    "多方力道≥80 ＋ 量能斜率轉弱(近5日均量<近10日均量20%以上) ＋ 創52週新高": {"10": {"n": 993, "moonshotN": 64, "pct": 6.4, "avg": 41.5}, "20": {"n": 993, "moonshotN": 131, "pct": 13.2, "avg": 51.9}},
-    "強勢突破盤 ＋ 量能斜率轉弱(近5日均量<近10日均量20%以上) ＋ 創52週新高": {"10": {"n": 521, "moonshotN": 36, "pct": 6.9, "avg": 41.4}, "20": {"n": 521, "moonshotN": 69, "pct": 13.2, "avg": 53.7}},
-    "相對強弱為正(強於大盤) ＋ 近3日向上跳空缺口 ＋ 母子懷抱(低檔)剛形成": {"10": {"n": 167, "moonshotN": 14, "pct": 8.4, "avg": 42.3}, "20": {"n": 167, "moonshotN": 22, "pct": 13.2, "avg": 59.5}},
-    "創52週新高 ＋ N字底剛形成 ＋ 突破飆股大量黑K最高點剛形成": {"10": {"n": 76, "moonshotN": 7, "pct": 9.2, "avg": 54.6}, "20": {"n": 76, "moonshotN": 10, "pct": 13.2, "avg": 69.9}},
-    "均線多頭排列(5>20>60且站上月線) ＋ 近3日向上跳空缺口 ＋ 母子懷抱(低檔)剛形成": {"10": {"n": 121, "moonshotN": 11, "pct": 9.1, "avg": 42.4}, "20": {"n": 121, "moonshotN": 16, "pct": 13.2, "avg": 59.0}},
-    "爆量(≥2倍均量) ＋ 距52週高點≤5% ＋ 晨星剛形成": {"10": {"n": 130, "moonshotN": 11, "pct": 8.5, "avg": 42.3}, "20": {"n": 130, "moonshotN": 17, "pct": 13.1, "avg": 54.6}},
-    "量能斜率轉弱(近5日均量<近10日均量20%以上) ＋ 創52週新高 ＋ 三大法人近3月賣超": {"10": {"n": 153, "moonshotN": 7, "pct": 4.6, "avg": 44.7}, "20": {"n": 153, "moonshotN": 20, "pct": 13.1, "avg": 44.4}},
-    "創52週新高 ＋ 近3月均價YoY為負 ＋ N字底剛形成": {"10": {"n": 184, "moonshotN": 9, "pct": 4.9, "avg": 50.6}, "20": {"n": 183, "moonshotN": 24, "pct": 13.1, "avg": 48.7}},
-    "創52週新高 ＋ 三大法人近3月買超 ＋ 晨星剛形成": {"10": {"n": 145, "moonshotN": 10, "pct": 6.9, "avg": 40.3}, "20": {"n": 145, "moonshotN": 19, "pct": 13.1, "avg": 47.5}},
-    "強勢突破盤 ＋ 地量(≤0.5倍均量) ＋ 均線多頭排列(5>20>60且站上月線)": {"10": {"n": 563, "moonshotN": 41, "pct": 7.3, "avg": 47.3}, "20": {"n": 561, "moonshotN": 73, "pct": 13.0, "avg": 55.7}},
-    "創52週新高 ＋ 距52週高點≤5% ＋ 晨星剛形成": {"10": {"n": 169, "moonshotN": 11, "pct": 6.5, "avg": 40.5}, "20": {"n": 169, "moonshotN": 22, "pct": 13.0, "avg": 52.4}},
-    "多方力道≥80 ＋ 創52週新高 ＋ 近3日向上跳空缺口": {"10": {"n": 3933, "moonshotN": 247, "pct": 6.3, "avg": 44.5}, "20": {"n": 3934, "moonshotN": 507, "pct": 12.9, "avg": 51.9}},
-    "強勢突破盤 ＋ 量能斜率轉弱(近5日均量<近10日均量20%以上) ＋ 近3日向上跳空缺口": {"10": {"n": 533, "moonshotN": 37, "pct": 6.9, "avg": 42.1}, "20": {"n": 533, "moonshotN": 69, "pct": 12.9, "avg": 56.2}},
-    "創52週新高 ＋ 三大法人近3月賣超 ＋ N字底剛形成": {"10": {"n": 93, "moonshotN": 7, "pct": 7.5, "avg": 47.2}, "20": {"n": 93, "moonshotN": 12, "pct": 12.9, "avg": 46.9}},
-    "均線多頭排列(5>20>60且站上月線) ＋ 近3月均價YoY為正 ＋ 晨星剛形成": {"10": {"n": 582, "moonshotN": 46, "pct": 7.9, "avg": 44.3}, "20": {"n": 582, "moonshotN": 75, "pct": 12.9, "avg": 53.5}},
-    "多方力道≥65 ＋ 創52週新高 ＋ 近3日向上跳空缺口": {"10": {"n": 5214, "moonshotN": 346, "pct": 6.6, "avg": 45.5}, "20": {"n": 5215, "moonshotN": 665, "pct": 12.8, "avg": 53.1}},
-    "相對強弱為正(強於大盤) ＋ 均線多頭排列(5>20>60且站上月線) ＋ 晨星剛形成": {"10": {"n": 807, "moonshotN": 55, "pct": 6.8, "avg": 42.5}, "20": {"n": 807, "moonshotN": 103, "pct": 12.8, "avg": 51.1}},
-    "大盤站上20日均線 ＋ 均線多頭排列(5>20>60且站上月線) ＋ 晨星剛形成": {"10": {"n": 728, "moonshotN": 51, "pct": 7.0, "avg": 42.9}, "20": {"n": 728, "moonshotN": 93, "pct": 12.8, "avg": 52.2}},
-    "量能斜率轉弱(近5日均量<近10日均量20%以上) ＋ 距52週高點≤5% ＋ 近3日向上跳空缺口": {"10": {"n": 758, "moonshotN": 43, "pct": 5.7, "avg": 41.9}, "20": {"n": 758, "moonshotN": 96, "pct": 12.7, "avg": 54.3}},
-    "創52週新高 ＋ 近3日向上跳空缺口 ＋ 近3月均價YoY為負": {"10": {"n": 1687, "moonshotN": 114, "pct": 6.8, "avg": 46.1}, "20": {"n": 1687, "moonshotN": 215, "pct": 12.7, "avg": 53.0}},
-    "大盤站上60日均線 ＋ 創52週新高 ＋ 近3日向上跳空缺口": {"10": {"n": 5700, "moonshotN": 366, "pct": 6.4, "avg": 45.7}, "20": {"n": 5700, "moonshotN": 719, "pct": 12.6, "avg": 52.9}},
-    "均線多頭排列(5>20>60且站上月線) ＋ N字底剛形成 ＋ 突破飆股大量黑K最高點剛形成": {"10": {"n": 135, "moonshotN": 9, "pct": 6.7, "avg": 54.7}, "20": {"n": 135, "moonshotN": 17, "pct": 12.6, "avg": 62.0}},
-    "多方力道≥80 ＋ 回後買上漲全通過 ＋ 近3日向上跳空缺口": {"10": {"n": 1522, "moonshotN": 93, "pct": 6.1, "avg": 43.8}, "20": {"n": 1522, "moonshotN": 190, "pct": 12.5, "avg": 51.9}},
-    "KDJ近3日內黃金交叉 ＋ 創52週新高 ＋ 近3日向上跳空缺口": {"10": {"n": 2322, "moonshotN": 151, "pct": 6.5, "avg": 45.3}, "20": {"n": 2322, "moonshotN": 291, "pct": 12.5, "avg": 52.7}},
-    "量能斜率轉強(近5日均量>近10日均量20%以上) ＋ 創52週新高 ＋ 晨星剛形成": {"10": {"n": 88, "moonshotN": 3, "pct": 3.4, "avg": 43.0}, "20": {"n": 88, "moonshotN": 11, "pct": 12.5, "avg": 53.5}},
-    "量能斜率轉弱(近5日均量<近10日均量20%以上) ＋ 大盤站上60日均線 ＋ 創52週新高": {"10": {"n": 1128, "moonshotN": 72, "pct": 6.4, "avg": 42.3}, "20": {"n": 1128, "moonshotN": 141, "pct": 12.5, "avg": 52.0}},
-    "大盤站上60日均線 ＋ 均線多頭排列(5>20>60且站上月線) ＋ 晨星剛形成": {"10": {"n": 797, "moonshotN": 54, "pct": 6.8, "avg": 43.4}, "20": {"n": 797, "moonshotN": 100, "pct": 12.5, "avg": 52.2}},
-    "回後買上漲全通過 ＋ 創52週新高 ＋ 近3月均價YoY為負": {"10": {"n": 991, "moonshotN": 68, "pct": 6.9, "avg": 44.2}, "20": {"n": 990, "moonshotN": 124, "pct": 12.5, "avg": 49.6}},
-    "創52週新高 ＋ 近3月均價YoY為負 ＋ 突破飆股大量黑K最高點剛形成": {"10": {"n": 297, "moonshotN": 16, "pct": 5.4, "avg": 42.9}, "20": {"n": 297, "moonshotN": 37, "pct": 12.5, "avg": 52.4}},
-    "相對強弱為正(強於大盤) ＋ 創52週新高 ＋ 近3日向上跳空缺口": {"10": {"n": 5894, "moonshotN": 376, "pct": 6.4, "avg": 45.6}, "20": {"n": 5895, "moonshotN": 731, "pct": 12.4, "avg": 52.9}},
-    "量能斜率轉弱(近5日均量<近10日均量20%以上) ＋ 回後買上漲全通過 ＋ 距52週高點≤5%": {"10": {"n": 467, "moonshotN": 31, "pct": 6.6, "avg": 43.7}, "20": {"n": 467, "moonshotN": 58, "pct": 12.4, "avg": 55.3}},
-    "回後買上漲全通過 ＋ 距52週高點≤5% ＋ 近3日向上跳空缺口": {"10": {"n": 1928, "moonshotN": 125, "pct": 6.5, "avg": 43.6}, "20": {"n": 1928, "moonshotN": 239, "pct": 12.4, "avg": 51.9}},
-    "均線多頭排列(5>20>60且站上月線) ＋ 三大法人近3月買超 ＋ 晨星剛形成": {"10": {"n": 655, "moonshotN": 46, "pct": 7.0, "avg": 44.2}, "20": {"n": 655, "moonshotN": 81, "pct": 12.4, "avg": 51.2}},
-    "多方力道≥65 ＋ 均線多頭排列(5>20>60且站上月線) ＋ 晨星剛形成": {"10": {"n": 652, "moonshotN": 43, "pct": 6.6, "avg": 42.9}, "20": {"n": 652, "moonshotN": 80, "pct": 12.3, "avg": 51.4}},
-    "相對強弱為正(強於大盤) ＋ 量能斜率轉弱(近5日均量<近10日均量20%以上) ＋ 創52週新高": {"10": {"n": 1167, "moonshotN": 71, "pct": 6.1, "avg": 42.0}, "20": {"n": 1167, "moonshotN": 143, "pct": 12.3, "avg": 51.5}},
-    "地量(≤0.5倍均量) ＋ 量能區間高檔(≥90百分位) ＋ 距52週高點≤5%": {"10": {"n": 139, "moonshotN": 8, "pct": 5.8, "avg": 51.5}, "20": {"n": 138, "moonshotN": 17, "pct": 12.3, "avg": 44.3}},
-    "回後買上漲全通過 ＋ 創52週新高 ＋ 晨星剛形成": {"10": {"n": 122, "moonshotN": 8, "pct": 6.6, "avg": 41.8}, "20": {"n": 122, "moonshotN": 15, "pct": 12.3, "avg": 51.4}},
-    "創52週新高 ＋ 均線多頭排列(5>20>60且站上月線) ＋ 近3日向上跳空缺口": {"10": {"n": 5911, "moonshotN": 374, "pct": 6.3, "avg": 45.6}, "20": {"n": 5911, "moonshotN": 728, "pct": 12.3, "avg": 52.8}},
-    "均線多頭排列(5>20>60且站上月線) ＋ 晨星剛形成": {"10": {"n": 908, "moonshotN": 59, "pct": 6.5, "avg": 43.0}, "20": {"n": 908, "moonshotN": 111, "pct": 12.2, "avg": 51.3}},
-    "多方力道≥65 ＋ 距52週高點≤5% ＋ 晨星剛形成": {"10": {"n": 312, "moonshotN": 23, "pct": 7.4, "avg": 45.7}, "20": {"n": 312, "moonshotN": 38, "pct": 12.2, "avg": 50.0}},
-    "KDJ近3日內死亡交叉 ＋ 創52週新高 ＋ 近3日向上跳空缺口": {"10": {"n": 657, "moonshotN": 35, "pct": 5.3, "avg": 47.3}, "20": {"n": 657, "moonshotN": 80, "pct": 12.2, "avg": 51.4}},
-    "爆量(≥1.5倍均量) ＋ 創52週新高 ＋ 晨星剛形成": {"10": {"n": 115, "moonshotN": 8, "pct": 7.0, "avg": 41.3}, "20": {"n": 115, "moonshotN": 14, "pct": 12.2, "avg": 60.0}},
-    "量能區間高檔(≥90百分位) ＋ 創52週新高 ＋ 晨星剛形成": {"10": {"n": 131, "moonshotN": 8, "pct": 6.1, "avg": 40.7}, "20": {"n": 131, "moonshotN": 16, "pct": 12.2, "avg": 55.1}},
-    "量能斜率轉強(近5日均量>近10日均量20%以上) ＋ 創52週新高 ＋ N字底剛形成": {"10": {"n": 148, "moonshotN": 10, "pct": 6.8, "avg": 50.0}, "20": {"n": 148, "moonshotN": 18, "pct": 12.2, "avg": 50.9}},
-    "均線多頭排列(5>20>60且站上月線) ＋ 突破ABC修正下降切線剛形成 ＋ 晨星剛形成": {"10": {"n": 98, "moonshotN": 8, "pct": 8.2, "avg": 34.1}, "20": {"n": 98, "moonshotN": 12, "pct": 12.2, "avg": 47.9}},
-    "強勢突破盤 ＋ 距52週高點≤5% ＋ 晨星剛形成": {"10": {"n": 214, "moonshotN": 13, "pct": 6.1, "avg": 46.2}, "20": {"n": 214, "moonshotN": 26, "pct": 12.1, "avg": 51.0}},
-    "布林通道高檔(≥80%) ＋ 均線多頭排列(5>20>60且站上月線) ＋ 晨星剛形成": {"10": {"n": 653, "moonshotN": 42, "pct": 6.4, "avg": 43.7}, "20": {"n": 653, "moonshotN": 79, "pct": 12.1, "avg": 49.7}},
-    "爆量(≥1.5倍均量) ＋ 量能斜率轉弱(近5日均量<近10日均量20%以上) ＋ 距52週高點≤5%": {"10": {"n": 379, "moonshotN": 18, "pct": 4.7, "avg": 39.3}, "20": {"n": 380, "moonshotN": 46, "pct": 12.1, "avg": 47.7}},
-    "量能區間高檔(≥90百分位) ＋ 量能斜率轉弱(近5日均量<近10日均量20%以上) ＋ 創52週新高": {"10": {"n": 495, "moonshotN": 27, "pct": 5.5, "avg": 42.8}, "20": {"n": 495, "moonshotN": 60, "pct": 12.1, "avg": 48.6}},
-    "創52週新高 ＋ 近3日向上跳空缺口 ＋ 三大法人近3月買超": {"10": {"n": 5181, "moonshotN": 303, "pct": 5.8, "avg": 45.8}, "20": {"n": 5181, "moonshotN": 626, "pct": 12.1, "avg": 52.6}},
-    "創52週新高 ＋ 近3日向上跳空缺口 ＋ 突破飆股大量黑K最高點剛形成": {"10": {"n": 364, "moonshotN": 19, "pct": 5.2, "avg": 44.4}, "20": {"n": 364, "moonshotN": 44, "pct": 12.1, "avg": 53.6}},
-    "距52週高點≤5% ＋ 三大法人近3月賣超 ＋ 突破飆股大量黑K最高點剛形成": {"10": {"n": 273, "moonshotN": 17, "pct": 6.2, "avg": 46.2}, "20": {"n": 273, "moonshotN": 33, "pct": 12.1, "avg": 53.1}},
-    "創52週新高 ＋ 近3日向上跳空缺口": {"10": {"n": 6229, "moonshotN": 385, "pct": 6.2, "avg": 45.6}, "20": {"n": 6229, "moonshotN": 750, "pct": 12.0, "avg": 52.8}},
-    "多方力道≥65 ＋ 量能斜率轉弱(近5日均量<近10日均量20%以上) ＋ 創52週新高": {"10": {"n": 1165, "moonshotN": 69, "pct": 5.9, "avg": 41.9}, "20": {"n": 1165, "moonshotN": 140, "pct": 12.0, "avg": 51.5}},
-    "多方力道≥80 ＋ 創52週新高 ＋ N字底剛形成": {"10": {"n": 617, "moonshotN": 42, "pct": 6.8, "avg": 41.7}, "20": {"n": 617, "moonshotN": 74, "pct": 12.0, "avg": 49.5}},
-    "布林通道高檔(≥80%) ＋ 創52週新高 ＋ 近3日向上跳空缺口": {"10": {"n": 6110, "moonshotN": 378, "pct": 6.2, "avg": 45.6}, "20": {"n": 6110, "moonshotN": 734, "pct": 12.0, "avg": 52.5}},
-    "KDJ近3日內黃金交叉 ＋ 均線多頭排列(5>20>60且站上月線) ＋ 晨星剛形成": {"10": {"n": 367, "moonshotN": 27, "pct": 7.4, "avg": 44.7}, "20": {"n": 367, "moonshotN": 44, "pct": 12.0, "avg": 53.8}},
-    "量能斜率轉弱(近5日均量<近10日均量20%以上) ＋ 創52週新高 ＋ 近3月乖離度為負(股價超前營收)": {"10": {"n": 657, "moonshotN": 44, "pct": 6.7, "avg": 43.4}, "20": {"n": 657, "moonshotN": 79, "pct": 12.0, "avg": 56.2}},
-    "大盤站上20日均線 ＋ 創52週新高 ＋ 近3日向上跳空缺口": {"10": {"n": 5314, "moonshotN": 319, "pct": 6.0, "avg": 45.3}, "20": {"n": 5313, "moonshotN": 640, "pct": 12.0, "avg": 51.8}},
-    "大盤站上20日均線 ＋ 創52週新高 ＋ N字底剛形成": {"10": {"n": 692, "moonshotN": 46, "pct": 6.6, "avg": 43.5}, "20": {"n": 691, "moonshotN": 83, "pct": 12.0, "avg": 50.4}},
-    "大盤跌破20日均線 ＋ 創52週新高 ＋ 近3日向上跳空缺口": {"10": {"n": 915, "moonshotN": 66, "pct": 7.2, "avg": 46.9}, "20": {"n": 916, "moonshotN": 110, "pct": 12.0, "avg": 58.2}},
-    "創52週新高 ＋ 距52週高點≤5% ＋ 母子懷抱(低檔)剛形成": {"10": {"n": 92, "moonshotN": 6, "pct": 6.5, "avg": 40.0}, "20": {"n": 92, "moonshotN": 11, "pct": 12.0, "avg": 54.5}},
-    "布林通道高檔(≥80%) ＋ 量能斜率轉弱(近5日均量<近10日均量20%以上) ＋ 創52週新高": {"10": {"n": 1139, "moonshotN": 67, "pct": 5.9, "avg": 41.5}, "20": {"n": 1139, "moonshotN": 136, "pct": 11.9, "avg": 51.2}},
-    "量能斜率轉弱(近5日均量<近10日均量20%以上) ＋ 大盤站上20日均線 ＋ 創52週新高": {"10": {"n": 1043, "moonshotN": 60, "pct": 5.8, "avg": 41.1}, "20": {"n": 1043, "moonshotN": 124, "pct": 11.9, "avg": 50.0}},
-    "創52週新高 ＋ 距52週高點≤5% ＋ 近3日向上跳空缺口": {"10": {"n": 5169, "moonshotN": 322, "pct": 6.2, "avg": 44.7}, "20": {"n": 5169, "moonshotN": 614, "pct": 11.9, "avg": 52.5}},
-    "創52週新高 ＋ 近3日向上跳空缺口 ＋ 近3月乖離度為負(股價超前營收)": {"10": {"n": 3356, "moonshotN": 191, "pct": 5.7, "avg": 46.9}, "20": {"n": 3356, "moonshotN": 400, "pct": 11.9, "avg": 53.1}},
-    "創52週新高 ＋ 近3月乖離度為正(營收優於股價) ＋ N字底剛形成": {"10": {"n": 355, "moonshotN": 20, "pct": 5.6, "avg": 42.7}, "20": {"n": 354, "moonshotN": 42, "pct": 11.9, "avg": 48.7}},
-    "創52週新高 ＋ 近3月乖離度為正(營收優於股價) ＋ 突破飆股大量黑K最高點剛形成": {"10": {"n": 488, "moonshotN": 29, "pct": 5.9, "avg": 44.2}, "20": {"n": 488, "moonshotN": 58, "pct": 11.9, "avg": 54.2}},
-    "距52週高點≤5% ＋ 近3日向上跳空缺口 ＋ N字底剛形成": {"10": {"n": 285, "moonshotN": 23, "pct": 8.1, "avg": 42.5}, "20": {"n": 285, "moonshotN": 34, "pct": 11.9, "avg": 51.8}},
-    "均線多頭排列(5>20>60且站上月線) ＋ 三大法人近3月賣超 ＋ 晨星剛形成": {"10": {"n": 252, "moonshotN": 13, "pct": 5.2, "avg": 38.8}, "20": {"n": 252, "moonshotN": 30, "pct": 11.9, "avg": 51.7}},
-    "多方力道≥80 ＋ 回後買上漲全通過 ＋ 創52週新高": {"10": {"n": 2777, "moonshotN": 173, "pct": 6.2, "avg": 42.4}, "20": {"n": 2777, "moonshotN": 327, "pct": 11.8, "avg": 50.7}},
-    "多方力道≥80 ＋ 近3日向上跳空缺口 ＋ N字底剛形成": {"10": {"n": 262, "moonshotN": 21, "pct": 8.0, "avg": 41.0}, "20": {"n": 262, "moonshotN": 31, "pct": 11.8, "avg": 49.0}},
-    "強勢突破盤 ＋ 創52週新高 ＋ 近3日向上跳空缺口": {"10": {"n": 4364, "moonshotN": 283, "pct": 6.5, "avg": 45.6}, "20": {"n": 4364, "moonshotN": 517, "pct": 11.8, "avg": 53.0}},
-    "KDJ近3日內黃金交叉 ＋ 創52週新高 ＋ N字底剛形成": {"10": {"n": 604, "moonshotN": 40, "pct": 6.6, "avg": 43.0}, "20": {"n": 603, "moonshotN": 71, "pct": 11.8, "avg": 52.7}},
-    "量能區間高檔(≥90百分位) ＋ 創52週新高 ＋ N字底剛形成": {"10": {"n": 578, "moonshotN": 39, "pct": 6.7, "avg": 44.6}, "20": {"n": 577, "moonshotN": 68, "pct": 11.8, "avg": 50.9}},
-    "量能斜率轉弱(近5日均量<近10日均量20%以上) ＋ 均線多頭排列(5>20>60且站上月線) ＋ 近3日向上跳空缺口": {"10": {"n": 1961, "moonshotN": 104, "pct": 5.3, "avg": 43.0}, "20": {"n": 1961, "moonshotN": 231, "pct": 11.8, "avg": 56.0}},
-    "創52週新高 ＋ 近3日向上跳空缺口 ＋ 近3月均價YoY為正": {"10": {"n": 4542, "moonshotN": 271, "pct": 6.0, "avg": 45.4}, "20": {"n": 4542, "moonshotN": 535, "pct": 11.8, "avg": 52.7}},
-    "創52週新高 ＋ 近3日向上跳空缺口 ＋ 三大法人近3月賣超": {"10": {"n": 1048, "moonshotN": 82, "pct": 7.8, "avg": 45.0}, "20": {"n": 1048, "moonshotN": 124, "pct": 11.8, "avg": 53.4}},
-    "距52週高點≤5% ＋ N字底剛形成 ＋ 突破飆股大量黑K最高點剛形成": {"10": {"n": 102, "moonshotN": 8, "pct": 7.8, "avg": 56.1}, "20": {"n": 102, "moonshotN": 12, "pct": 11.8, "avg": 67.9}},
-    "多方力道≥80 ＋ 距52週高點≤5% ＋ 近3日向上跳空缺口": {"10": {"n": 4589, "moonshotN": 255, "pct": 5.6, "avg": 43.2}, "20": {"n": 4589, "moonshotN": 537, "pct": 11.7, "avg": 51.1}},
-    "創52週新高 ＋ 近3日向上跳空缺口 ＋ 突破ABC修正下降切線剛形成": {"10": {"n": 358, "moonshotN": 26, "pct": 7.3, "avg": 43.5}, "20": {"n": 358, "moonshotN": 42, "pct": 11.7, "avg": 54.4}},
-    "距52週高點≤5% ＋ 近3月乖離度為負(股價超前營收) ＋ 母子懷抱(低檔)剛形成": {"10": {"n": 154, "moonshotN": 10, "pct": 6.5, "avg": 46.5}, "20": {"n": 154, "moonshotN": 18, "pct": 11.7, "avg": 47.4}},
-    "量能斜率轉強(近5日均量>近10日均量20%以上) ＋ 均線多頭排列(5>20>60且站上月線) ＋ 晨星剛形成": {"10": {"n": 346, "moonshotN": 23, "pct": 6.6, "avg": 42.2}, "20": {"n": 346, "moonshotN": 40, "pct": 11.6, "avg": 49.6}},
-    "量能斜率轉弱(近5日均量<近10日均量20%以上) ＋ 大盤跌破60日均線 ＋ 母子懷抱(高檔)剛形成": {"10": {"n": 86, "moonshotN": 6, "pct": 7.0, "avg": 52.4}, "20": {"n": 86, "moonshotN": 10, "pct": 11.6, "avg": 55.0}},
-    "量能斜率轉弱(近5日均量<近10日均量20%以上) ＋ 創52週新高 ＋ 均線多頭排列(5>20>60且站上月線)": {"10": {"n": 1245, "moonshotN": 72, "pct": 5.8, "avg": 42.3}, "20": {"n": 1245, "moonshotN": 144, "pct": 11.6, "avg": 51.7}},
-    "創52週新高 ＋ 近3月均價YoY為負 ＋ 突破ABC修正下降切線剛形成": {"10": {"n": 198, "moonshotN": 10, "pct": 5.1, "avg": 38.8}, "20": {"n": 198, "moonshotN": 23, "pct": 11.6, "avg": 45.7}},
-    "量能斜率轉弱(近5日均量<近10日均量20%以上) ＋ 創52週新高": {"10": {"n": 1248, "moonshotN": 72, "pct": 5.8, "avg": 42.3}, "20": {"n": 1248, "moonshotN": 144, "pct": 11.5, "avg": 51.7}},
-    "地量(≤0.5倍均量) ＋ 創52週新高 ＋ 近3月乖離度為正(營收優於股價)": {"10": {"n": 209, "moonshotN": 13, "pct": 6.2, "avg": 40.1}, "20": {"n": 209, "moonshotN": 24, "pct": 11.5, "avg": 52.7}},
-    "量能區間高檔(≥90百分位) ＋ 量能斜率轉弱(近5日均量<近10日均量20%以上) ＋ 近3日向上跳空缺口": {"10": {"n": 729, "moonshotN": 36, "pct": 4.9, "avg": 42.7}, "20": {"n": 729, "moonshotN": 84, "pct": 11.5, "avg": 52.3}},
-    "量能區間高檔(≥90百分位) ＋ 距52週高點≤5% ＋ 晨星剛形成": {"10": {"n": 287, "moonshotN": 19, "pct": 6.6, "avg": 46.1}, "20": {"n": 287, "moonshotN": 33, "pct": 11.5, "avg": 51.3}},
-    "回後買上漲全通過 ＋ 創52週新高 ＋ N字底剛形成": {"10": {"n": 593, "moonshotN": 39, "pct": 6.6, "avg": 45.0}, "20": {"n": 592, "moonshotN": 68, "pct": 11.5, "avg": 52.2}},
-    "近3日向上跳空缺口 ＋ 三大法人近3月買超 ＋ 母子懷抱(低檔)剛形成": {"10": {"n": 209, "moonshotN": 12, "pct": 5.7, "avg": 42.9}, "20": {"n": 209, "moonshotN": 24, "pct": 11.5, "avg": 58.9}},
-    "MACD近3日內黃金交叉 ＋ 創52週新高 ＋ N字底剛形成": {"10": {"n": 105, "moonshotN": 7, "pct": 6.7, "avg": 43.9}, "20": {"n": 105, "moonshotN": 12, "pct": 11.4, "avg": 52.8}},
-    "多方力道≥65 ＋ 地量(≤0.5倍均量) ＋ 近3日向上跳空缺口": {"10": {"n": 1467, "moonshotN": 86, "pct": 5.9, "avg": 44.9}, "20": {"n": 1467, "moonshotN": 166, "pct": 11.3, "avg": 57.9}},
-    "多方力道≥65 ＋ 回後買上漲全通過 ＋ 創52週新高": {"10": {"n": 3581, "moonshotN": 225, "pct": 6.3, "avg": 43.5}, "20": {"n": 3581, "moonshotN": 406, "pct": 11.3, "avg": 51.4}},
-    "量能區間低檔(≤10百分位) ＋ 均線多頭排列(5>20>60且站上月線) ＋ 近3日向上跳空缺口": {"10": {"n": 177, "moonshotN": 10, "pct": 5.6, "avg": 44.8}, "20": {"n": 177, "moonshotN": 20, "pct": 11.3, "avg": 53.0}},
-    "量能斜率轉弱(近5日均量<近10日均量20%以上) ＋ 創52週新高 ＋ 三大法人近3月買超": {"10": {"n": 1095, "moonshotN": 65, "pct": 5.9, "avg": 42.0}, "20": {"n": 1095, "moonshotN": 124, "pct": 11.3, "avg": 52.8}},
-    "大盤站上20日均線 ＋ 回後買上漲全通過 ＋ 創52週新高": {"10": {"n": 3515, "moonshotN": 211, "pct": 6.0, "avg": 43.4}, "20": {"n": 3514, "moonshotN": 396, "pct": 11.3, "avg": 50.1}},
-    "大盤站上20日均線 ＋ 創52週新高 ＋ 突破飆股大量黑K最高點剛形成": {"10": {"n": 846, "moonshotN": 53, "pct": 6.3, "avg": 46.6}, "20": {"n": 846, "moonshotN": 96, "pct": 11.3, "avg": 53.6}},
-    "距52週高點≤5% ＋ 近3日向上跳空缺口 ＋ 突破飆股大量黑K最高點剛形成": {"10": {"n": 444, "moonshotN": 21, "pct": 4.7, "avg": 47.0}, "20": {"n": 444, "moonshotN": 50, "pct": 11.3, "avg": 54.5}},
-    "MACD近3日內黃金交叉 ＋ 均線多頭排列(5>20>60且站上月線) ＋ 夜星剛形成": {"10": {"n": 98, "moonshotN": 3, "pct": 3.1, "avg": 33.1}, "20": {"n": 98, "moonshotN": 11, "pct": 11.2, "avg": 52.2}},
-    "相對強弱為正(強於大盤) ＋ 回後買上漲全通過 ＋ 創52週新高": {"10": {"n": 3963, "moonshotN": 242, "pct": 6.1, "avg": 43.5}, "20": {"n": 3962, "moonshotN": 443, "pct": 11.2, "avg": 51.2}},
-    "爆量(≥1.5倍均量) ＋ 創52週新高 ＋ N字底剛形成": {"10": {"n": 465, "moonshotN": 29, "pct": 6.2, "avg": 44.7}, "20": {"n": 464, "moonshotN": 52, "pct": 11.2, "avg": 52.8}},
-    "爆量(≥1.5倍均量) ＋ 距52週高點≤5% ＋ 晨星剛形成": {"10": {"n": 224, "moonshotN": 15, "pct": 6.7, "avg": 43.2}, "20": {"n": 224, "moonshotN": 25, "pct": 11.2, "avg": 53.7}},
-    "大盤站上60日均線 ＋ 回後買上漲全通過 ＋ 創52週新高": {"10": {"n": 3747, "moonshotN": 229, "pct": 6.1, "avg": 43.6}, "20": {"n": 3746, "moonshotN": 421, "pct": 11.2, "avg": 51.2}},
-    "大盤站上60日均線 ＋ 創52週新高 ＋ 突破飆股大量黑K最高點剛形成": {"10": {"n": 949, "moonshotN": 58, "pct": 6.1, "avg": 46.4}, "20": {"n": 949, "moonshotN": 106, "pct": 11.2, "avg": 54.5}},
-    "大盤跌破60日均線 ＋ 均線多頭排列(5>20>60且站上月線) ＋ 夜星剛形成": {"10": {"n": 107, "moonshotN": 8, "pct": 7.5, "avg": 45.1}, "20": {"n": 107, "moonshotN": 12, "pct": 11.2, "avg": 61.5}},
-    "回後買上漲全通過 ＋ 距52週高點≤5% ＋ 晨星剛形成": {"10": {"n": 188, "moonshotN": 11, "pct": 5.9, "avg": 41.6}, "20": {"n": 188, "moonshotN": 21, "pct": 11.2, "avg": 52.4}},
-    "創52週新高 ＋ 突破ABC修正下降切線剛形成 ＋ 突破飆股大量黑K最高點剛形成": {"10": {"n": 223, "moonshotN": 14, "pct": 6.3, "avg": 45.5}, "20": {"n": 223, "moonshotN": 25, "pct": 11.2, "avg": 49.9}},
-    "距52週高點≤5% ＋ 近3月均價YoY為負 ＋ 突破飆股大量黑K最高點剛形成": {"10": {"n": 430, "moonshotN": 21, "pct": 4.9, "avg": 44.9}, "20": {"n": 430, "moonshotN": 48, "pct": 11.2, "avg": 52.9}},
-    "強勢突破盤 ＋ 創52週新高 ＋ 晨星剛形成": {"10": {"n": 108, "moonshotN": 7, "pct": 6.5, "avg": 39.3}, "20": {"n": 108, "moonshotN": 12, "pct": 11.1, "avg": 48.6}},
-    "KDJ近3日內黃金交叉 ＋ 量能斜率轉弱(近5日均量<近10日均量20%以上) ＋ 創52週新高": {"10": {"n": 742, "moonshotN": 43, "pct": 5.8, "avg": 40.4}, "20": {"n": 742, "moonshotN": 82, "pct": 11.1, "avg": 49.8}},
-    "地量(≤0.5倍均量) ＋ 量能區間高檔(≥90百分位) ＋ 近3日向上跳空缺口": {"10": {"n": 145, "moonshotN": 7, "pct": 4.8, "avg": 44.3}, "20": {"n": 144, "moonshotN": 16, "pct": 11.1, "avg": 43.6}},
-    "大盤站上60日均線 ＋ 創52週新高 ＋ N字底剛形成": {"10": {"n": 731, "moonshotN": 48, "pct": 6.6, "avg": 43.7}, "20": {"n": 730, "moonshotN": 81, "pct": 11.1, "avg": 51.8}},
-    "回後買上漲全通過 ＋ 創52週新高 ＋ 突破ABC修正下降切線剛形成": {"10": {"n": 343, "moonshotN": 24, "pct": 7.0, "avg": 47.1}, "20": {"n": 343, "moonshotN": 38, "pct": 11.1, "avg": 56.0}},
-    "多方力道≥65 ＋ 創52週新高 ＋ N字底剛形成": {"10": {"n": 747, "moonshotN": 48, "pct": 6.4, "avg": 43.3}, "20": {"n": 747, "moonshotN": 82, "pct": 11.0, "avg": 51.0}},
-    "多方力道≥65 ＋ 距52週高點≤5% ＋ 近3日向上跳空缺口": {"10": {"n": 6456, "moonshotN": 361, "pct": 5.6, "avg": 44.1}, "20": {"n": 6456, "moonshotN": 709, "pct": 11.0, "avg": 52.0}},
-    "多方力道≥80 ＋ 回後買上漲全通過 ＋ 距52週高點≤5%": {"10": {"n": 3261, "moonshotN": 196, "pct": 6.0, "avg": 42.5}, "20": {"n": 3261, "moonshotN": 359, "pct": 11.0, "avg": 51.1}},
-    "相對強弱為正(強於大盤) ＋ 創52週新高 ＋ N字底剛形成": {"10": {"n": 775, "moonshotN": 50, "pct": 6.5, "avg": 43.8}, "20": {"n": 774, "moonshotN": 85, "pct": 11.0, "avg": 51.7}},
-    "量能區間高檔(≥90百分位) ＋ 創52週新高 ＋ 近3日向上跳空缺口": {"10": {"n": 4797, "moonshotN": 274, "pct": 5.7, "avg": 45.6}, "20": {"n": 4798, "moonshotN": 529, "pct": 11.0, "avg": 52.4}},
-    "量能斜率轉強(近5日均量>近10日均量20%以上) ＋ 創52週新高 ＋ 近3日向上跳空缺口": {"10": {"n": 3713, "moonshotN": 212, "pct": 5.7, "avg": 45.9}, "20": {"n": 3713, "moonshotN": 408, "pct": 11.0, "avg": 54.0}},
-    "量能斜率轉弱(近5日均量<近10日均量20%以上) ＋ 創52週新高 ＋ 距52週高點≤5%": {"10": {"n": 1101, "moonshotN": 60, "pct": 5.4, "avg": 40.3}, "20": {"n": 1101, "moonshotN": 121, "pct": 11.0, "avg": 51.1}},
-    "大盤站上20日均線 ＋ 近3日向上跳空缺口 ＋ 母子懷抱(低檔)剛形成": {"10": {"n": 218, "moonshotN": 12, "pct": 5.5, "avg": 37.4}, "20": {"n": 218, "moonshotN": 24, "pct": 11.0, "avg": 52.8}},
-    "回後買上漲全通過 ＋ 創52週新高 ＋ 均線多頭排列(5>20>60且站上月線)": {"10": {"n": 4055, "moonshotN": 242, "pct": 6.0, "avg": 43.6}, "20": {"n": 4054, "moonshotN": 445, "pct": 11.0, "avg": 51.2}},
-    "回後買上漲全通過 ＋ 創52週新高 ＋ 突破飆股大量黑K最高點剛形成": {"10": {"n": 574, "moonshotN": 39, "pct": 6.8, "avg": 45.9}, "20": {"n": 574, "moonshotN": 63, "pct": 11.0, "avg": 54.6}},
-    "創52週新高 ＋ 近3月均價YoY為負 ＋ 三大法人近3月賣超": {"10": {"n": 745, "moonshotN": 47, "pct": 6.3, "avg": 43.6}, "20": {"n": 745, "moonshotN": 82, "pct": 11.0, "avg": 45.8}},
-    "距52週高點≤5% ＋ 圓弧底剛形成 ＋ 突破ABC修正下降切線剛形成": {"10": {"n": 100, "moonshotN": 3, "pct": 3.0, "avg": 39.4}, "20": {"n": 100, "moonshotN": 11, "pct": 11.0, "avg": 43.5}},
-    "回後買上漲全通過 ＋ 創52週新高": {"10": {"n": 4175, "moonshotN": 246, "pct": 5.9, "avg": 43.6}, "20": {"n": 4174, "moonshotN": 454, "pct": 10.9, "avg": 51.0}},
-    "多方力道≥80 ＋ 創52週新高 ＋ 近3月均價YoY為負": {"10": {"n": 2692, "moonshotN": 136, "pct": 5.1, "avg": 42.7}, "20": {"n": 2692, "moonshotN": 294, "pct": 10.9, "avg": 49.3}},
-    "多方力道≥80 ＋ 距52週高點≤5% ＋ N字底剛形成": {"10": {"n": 768, "moonshotN": 46, "pct": 6.0, "avg": 42.0}, "20": {"n": 768, "moonshotN": 84, "pct": 10.9, "avg": 48.6}},
-    "強勢突破盤 ＋ 均線多頭排列(5>20>60且站上月線) ＋ 晨星剛形成": {"10": {"n": 359, "moonshotN": 18, "pct": 5.0, "avg": 45.7}, "20": {"n": 359, "moonshotN": 39, "pct": 10.9, "avg": 50.7}},
-    "布林通道高檔(≥80%) ＋ 量能斜率轉弱(近5日均量<近10日均量20%以上) ＋ 近3日向上跳空缺口": {"10": {"n": 1440, "moonshotN": 73, "pct": 5.1, "avg": 43.7}, "20": {"n": 1439, "moonshotN": 157, "pct": 10.9, "avg": 54.3}},
-    "布林通道高檔(≥80%) ＋ 回後買上漲全通過 ＋ 創52週新高": {"10": {"n": 4167, "moonshotN": 246, "pct": 5.9, "avg": 43.6}, "20": {"n": 4166, "moonshotN": 453, "pct": 10.9, "avg": 51.0}},
-    "相對強弱為負(弱於大盤) ＋ 量能斜率轉弱(近5日均量<近10日均量20%以上) ＋ 晨星剛形成": {"10": {"n": 119, "moonshotN": 4, "pct": 3.4, "avg": 46.7}, "20": {"n": 119, "moonshotN": 13, "pct": 10.9, "avg": 55.2}},
-    "爆量(≥1.5倍均量) ＋ 量能斜率轉弱(近5日均量<近10日均量20%以上) ＋ 近3日向上跳空缺口": {"10": {"n": 387, "moonshotN": 18, "pct": 4.7, "avg": 39.5}, "20": {"n": 387, "moonshotN": 42, "pct": 10.9, "avg": 50.0}},
-    "量能斜率轉強(近5日均量>近10日均量20%以上) ＋ 創52週新高 ＋ 近3月均價YoY為負": {"10": {"n": 2385, "moonshotN": 134, "pct": 5.6, "avg": 45.2}, "20": {"n": 2385, "moonshotN": 260, "pct": 10.9, "avg": 52.6}},
-    "大盤站上60日均線 ＋ 創52週新高 ＋ 近3月均價YoY為負": {"10": {"n": 3192, "moonshotN": 178, "pct": 5.6, "avg": 45.2}, "20": {"n": 3191, "moonshotN": 347, "pct": 10.9, "avg": 51.6}},
-    "回後買上漲全通過 ＋ 創52週新高 ＋ 距52週高點≤5%": {"10": {"n": 4173, "moonshotN": 246, "pct": 5.9, "avg": 43.6}, "20": {"n": 4172, "moonshotN": 454, "pct": 10.9, "avg": 51.0}},
-    "回後買上漲全通過 ＋ 創52週新高 ＋ 三大法人近3月買超": {"10": {"n": 3575, "moonshotN": 207, "pct": 5.8, "avg": 43.7}, "20": {"n": 3574, "moonshotN": 390, "pct": 10.9, "avg": 51.6}},
-    "回後買上漲全通過 ＋ 均線多頭排列(5>20>60且站上月線) ＋ 近3日向上跳空缺口": {"10": {"n": 2465, "moonshotN": 139, "pct": 5.6, "avg": 44.1}, "20": {"n": 2465, "moonshotN": 269, "pct": 10.9, "avg": 51.8}},
-    "均線多頭排列(5>20>60且站上月線) ＋ 近3月均價YoY為負 ＋ 晨星剛形成": {"10": {"n": 313, "moonshotN": 13, "pct": 4.2, "avg": 38.5}, "20": {"n": 313, "moonshotN": 34, "pct": 10.9, "avg": 47.6}},
-    "近3日向上跳空缺口 ＋ 近3月乖離度為負(股價超前營收) ＋ 母子懷抱(低檔)剛形成": {"10": {"n": 266, "moonshotN": 14, "pct": 5.3, "avg": 43.3}, "20": {"n": 266, "moonshotN": 29, "pct": 10.9, "avg": 57.6}},
-    "多方力道≥65 ＋ 創52週新高 ＋ 突破飆股大量黑K最高點剛形成": {"10": {"n": 935, "moonshotN": 61, "pct": 6.5, "avg": 46.1}, "20": {"n": 935, "moonshotN": 101, "pct": 10.8, "avg": 54.7}},
-    "KDJ近3日內黃金交叉 ＋ 近3月乖離度為負(股價超前營收) ＋ 夜星剛形成": {"10": {"n": 148, "moonshotN": 8, "pct": 5.4, "avg": 39.7}, "20": {"n": 148, "moonshotN": 16, "pct": 10.8, "avg": 45.9}},
-    "相對強弱為正(強於大盤) ＋ 創52週新高 ＋ 突破飆股大量黑K最高點剛形成": {"10": {"n": 1019, "moonshotN": 62, "pct": 6.1, "avg": 46.1}, "20": {"n": 1019, "moonshotN": 110, "pct": 10.8, "avg": 54.6}},
-    "相對強弱為正(強於大盤) ＋ 距52週高點≤5% ＋ 近3日向上跳空缺口": {"10": {"n": 7506, "moonshotN": 407, "pct": 5.4, "avg": 44.3}, "20": {"n": 7505, "moonshotN": 810, "pct": 10.8, "avg": 51.6}},
-    "爆量(≥1.5倍均量) ＋ 創52週新高 ＋ 近3日向上跳空缺口": {"10": {"n": 4373, "moonshotN": 249, "pct": 5.7, "avg": 45.7}, "20": {"n": 4374, "moonshotN": 471, "pct": 10.8, "avg": 52.6}},
-    "爆量(≥2倍均量) ＋ 均線多頭排列(5>20>60且站上月線) ＋ 晨星剛形成": {"10": {"n": 232, "moonshotN": 15, "pct": 6.5, "avg": 40.4}, "20": {"n": 232, "moonshotN": 25, "pct": 10.8, "avg": 52.5}},
-    "回後買上漲全通過 ＋ 創52週新高 ＋ 近3月乖離度為正(營收優於股價)": {"10": {"n": 1780, "moonshotN": 107, "pct": 6.0, "avg": 43.0}, "20": {"n": 1779, "moonshotN": 192, "pct": 10.8, "avg": 50.1}},
-    "創52週新高 ＋ 均線多頭排列(5>20>60且站上月線) ＋ N字底剛形成": {"10": {"n": 818, "moonshotN": 50, "pct": 6.1, "avg": 43.8}, "20": {"n": 817, "moonshotN": 88, "pct": 10.8, "avg": 51.2}},
-    "距52週高點≤5% ＋ 三大法人近3月賣超 ＋ N字底剛形成": {"10": {"n": 167, "moonshotN": 8, "pct": 4.8, "avg": 47.1}, "20": {"n": 167, "moonshotN": 18, "pct": 10.8, "avg": 42.9}},
-    "強勢突破盤 ＋ 回後買上漲全通過 ＋ 創52週新高": {"10": {"n": 2907, "moonshotN": 169, "pct": 5.8, "avg": 43.9}, "20": {"n": 2907, "moonshotN": 311, "pct": 10.7, "avg": 51.2}},
-    "相對強弱為正(強於大盤) ＋ 創52週新高 ＋ 近3月均價YoY為負": {"10": {"n": 3542, "moonshotN": 190, "pct": 5.4, "avg": 45.0}, "20": {"n": 3541, "moonshotN": 380, "pct": 10.7, "avg": 50.9}},
-    "量能區間高檔(≥90百分位) ＋ 回後買上漲全通過 ＋ 創52週新高": {"10": {"n": 3229, "moonshotN": 198, "pct": 6.1, "avg": 43.8}, "20": {"n": 3228, "moonshotN": 345, "pct": 10.7, "avg": 50.8}},
-    "量能斜率轉強(近5日均量>近10日均量20%以上) ＋ 回後買上漲全通過 ＋ 創52週新高": {"10": {"n": 1962, "moonshotN": 117, "pct": 6.0, "avg": 43.3}, "20": {"n": 1962, "moonshotN": 210, "pct": 10.7, "avg": 50.3}},
-    "回後買上漲全通過 ＋ 創52週新高 ＋ 三大法人近3月賣超": {"10": {"n": 599, "moonshotN": 39, "pct": 6.5, "avg": 42.9}, "20": {"n": 599, "moonshotN": 64, "pct": 10.7, "avg": 47.1}},
-    "創52週新高 ＋ 距52週高點≤5% ＋ 突破飆股大量黑K最高點剛形成": {"10": {"n": 1035, "moonshotN": 62, "pct": 6.0, "avg": 46.2}, "20": {"n": 1035, "moonshotN": 111, "pct": 10.7, "avg": 54.3}},
-    "距52週高點≤5% ＋ 近3日向上跳空缺口 ＋ 突破ABC修正下降切線剛形成": {"10": {"n": 486, "moonshotN": 30, "pct": 6.2, "avg": 43.6}, "20": {"n": 486, "moonshotN": 52, "pct": 10.7, "avg": 52.6}},
-    "均線多頭排列(5>20>60且站上月線) ＋ 近3月乖離度為負(股價超前營收) ＋ 母子懷抱(低檔)剛形成": {"10": {"n": 535, "moonshotN": 29, "pct": 5.4, "avg": 44.2}, "20": {"n": 535, "moonshotN": 57, "pct": 10.7, "avg": 51.8}},
-    "均線多頭排列(5>20>60且站上月線) ＋ 近3月均價YoY為正 ＋ 夜星剛形成": {"10": {"n": 458, "moonshotN": 25, "pct": 5.5, "avg": 43.1}, "20": {"n": 458, "moonshotN": 49, "pct": 10.7, "avg": 59.8}},
-    "均線多頭排列(5>20>60且站上月線) ＋ 母子懷抱(低檔)剛形成 ＋ 晨星剛形成": {"10": {"n": 270, "moonshotN": 20, "pct": 7.4, "avg": 41.5}, "20": {"n": 270, "moonshotN": 29, "pct": 10.7, "avg": 52.1}},
-    "創52週新高 ＋ N字底剛形成": {"10": {"n": 830, "moonshotN": 50, "pct": 6.0, "avg": 43.8}, "20": {"n": 829, "moonshotN": 88, "pct": 10.6, "avg": 51.2}},
-    "布林通道高檔(≥80%) ＋ 創52週新高 ＋ N字底剛形成": {"10": {"n": 821, "moonshotN": 50, "pct": 6.1, "avg": 43.8}, "20": {"n": 820, "moonshotN": 87, "pct": 10.6, "avg": 51.4}},
-    "MACD近3日內黃金交叉 ＋ 創52週新高 ＋ 突破飆股大量黑K最高點剛形成": {"10": {"n": 160, "moonshotN": 8, "pct": 5.0, "avg": 44.3}, "20": {"n": 160, "moonshotN": 17, "pct": 10.6, "avg": 56.4}},
-    "MACD近3日內黃金交叉 ＋ 均線多頭排列(5>20>60且站上月線) ＋ 晨星剛形成": {"10": {"n": 132, "moonshotN": 9, "pct": 6.8, "avg": 41.0}, "20": {"n": 132, "moonshotN": 14, "pct": 10.6, "avg": 50.8}},
-    "地量(≤0.5倍均量) ＋ 近3月乖離度為負(股價超前營收) ＋ 晨星剛形成": {"10": {"n": 104, "moonshotN": 4, "pct": 3.8, "avg": 39.3}, "20": {"n": 104, "moonshotN": 11, "pct": 10.6, "avg": 54.2}},
-    "量能區間高檔(≥90百分位) ＋ 近3月乖離度為負(股價超前營收) ＋ 夜星剛形成": {"10": {"n": 208, "moonshotN": 12, "pct": 5.8, "avg": 46.2}, "20": {"n": 208, "moonshotN": 22, "pct": 10.6, "avg": 66.6}},
-    "量能斜率轉弱(近5日均量<近10日均量20%以上) ＋ 創52週新高 ＋ N字底剛形成": {"10": {"n": 179, "moonshotN": 13, "pct": 7.3, "avg": 38.0}, "20": {"n": 179, "moonshotN": 19, "pct": 10.6, "avg": 52.3}},
-    "大盤跌破20日均線 ＋ 大盤站上60日均線 ＋ 創52週新高": {"10": {"n": 2068, "moonshotN": 108, "pct": 5.2, "avg": 45.0}, "20": {"n": 2068, "moonshotN": 220, "pct": 10.6, "avg": 53.3}},
-    "大盤站上60日均線 ＋ 創52週新高 ＋ 突破ABC修正下降切線剛形成": {"10": {"n": 899, "moonshotN": 52, "pct": 5.8, "avg": 45.0}, "20": {"n": 899, "moonshotN": 95, "pct": 10.6, "avg": 51.0}},
-    "回後買上漲全通過 ＋ 距52週高點≤5% ＋ 近3月均價YoY為負": {"10": {"n": 1344, "moonshotN": 81, "pct": 6.0, "avg": 44.5}, "20": {"n": 1343, "moonshotN": 143, "pct": 10.6, "avg": 50.0}},
-    "創52週新高 ＋ 近3月乖離度為正(營收優於股價) ＋ 近3月均價YoY為負": {"10": {"n": 3053, "moonshotN": 163, "pct": 5.3, "avg": 44.4}, "20": {"n": 3052, "moonshotN": 323, "pct": 10.6, "avg": 50.8}},
-    "距52週高點≤5% ＋ 近3日向上跳空缺口 ＋ 近3月均價YoY為負": {"10": {"n": 2215, "moonshotN": 126, "pct": 5.7, "avg": 45.1}, "20": {"n": 2215, "moonshotN": 234, "pct": 10.6, "avg": 52.4}},
-    "創52週新高 ＋ 突破飆股大量黑K最高點剛形成": {"10": {"n": 1063, "moonshotN": 63, "pct": 5.9, "avg": 46.0}, "20": {"n": 1063, "moonshotN": 112, "pct": 10.5, "avg": 54.1}},
-    "多方力道≥65 ＋ 創52週新高 ＋ 近3月均價YoY為負": {"10": {"n": 3321, "moonshotN": 170, "pct": 5.1, "avg": 44.1}, "20": {"n": 3321, "moonshotN": 350, "pct": 10.5, "avg": 50.4}},
-    "強勢突破盤 ＋ 距52週高點≤5% ＋ 近3日向上跳空缺口": {"10": {"n": 5322, "moonshotN": 296, "pct": 5.6, "avg": 44.8}, "20": {"n": 5322, "moonshotN": 561, "pct": 10.5, "avg": 52.2}},
-    "KDJ近3日內黃金交叉 ＋ 回後買上漲全通過 ＋ 創52週新高": {"10": {"n": 2183, "moonshotN": 132, "pct": 6.0, "avg": 43.2}, "20": {"n": 2182, "moonshotN": 230, "pct": 10.5, "avg": 51.4}},
-    "相對強弱為正(強於大盤) ＋ 大盤站上60日均線 ＋ 創52週新高": {"10": {"n": 13163, "moonshotN": 700, "pct": 5.3, "avg": 44.6}, "20": {"n": 13163, "moonshotN": 1378, "pct": 10.5, "avg": 51.8}},
-    "爆量(≥1.5倍均量) ＋ 均線多頭排列(5>20>60且站上月線) ＋ 晨星剛形成": {"10": {"n": 400, "moonshotN": 26, "pct": 6.5, "avg": 41.2}, "20": {"n": 400, "moonshotN": 42, "pct": 10.5, "avg": 50.3}},
-    "爆量(≥2倍均量) ＋ 創52週新高 ＋ 近3月均價YoY為負": {"10": {"n": 2226, "moonshotN": 130, "pct": 5.8, "avg": 45.5}, "20": {"n": 2225, "moonshotN": 234, "pct": 10.5, "avg": 52.8}},
-    "量能區間高檔(≥90百分位) ＋ 創52週新高 ＋ 近3月均價YoY為負": {"10": {"n": 3415, "moonshotN": 179, "pct": 5.2, "avg": 45.4}, "20": {"n": 3414, "moonshotN": 357, "pct": 10.5, "avg": 50.9}},
-    "創52週新高 ＋ 距52週高點≤5% ＋ N字底剛形成": {"10": {"n": 817, "moonshotN": 49, "pct": 6.0, "avg": 43.7}, "20": {"n": 816, "moonshotN": 86, "pct": 10.5, "avg": 51.0}},
-    "距52週高點≤5% ＋ 均線多頭排列(5>20>60且站上月線) ＋ 近3日向上跳空缺口": {"10": {"n": 7636, "moonshotN": 400, "pct": 5.2, "avg": 44.2}, "20": {"n": 7635, "moonshotN": 800, "pct": 10.5, "avg": 51.5}},
-    "距52週高點≤5% ＋ 母子懷抱(低檔)剛形成 ＋ 晨星剛形成": {"10": {"n": 133, "moonshotN": 10, "pct": 7.5, "avg": 46.5}, "20": {"n": 133, "moonshotN": 14, "pct": 10.5, "avg": 46.9}},
-    "均線多頭排列(5>20>60且站上月線) ＋ 三大法人近3月買超 ＋ 夜星剛形成": {"10": {"n": 474, "moonshotN": 26, "pct": 5.5, "avg": 43.7}, "20": {"n": 474, "moonshotN": 50, "pct": 10.5, "avg": 54.5}},
-    "多方力道≥80 ＋ 大盤站上20日均線 ＋ 創52週新高": {"10": {"n": 8574, "moonshotN": 437, "pct": 5.1, "avg": 43.4}, "20": {"n": 8574, "moonshotN": 892, "pct": 10.4, "avg": 49.9}},
-    "多方力道≥80 ＋ 大盤站上60日均線 ＋ 創52週新高": {"10": {"n": 9234, "moonshotN": 481, "pct": 5.2, "avg": 43.3}, "20": {"n": 9235, "moonshotN": 957, "pct": 10.4, "avg": 50.5}},
-    "多方力道≥80 ＋ 近3日向上跳空缺口 ＋ 近3月均價YoY為正": {"10": {"n": 5339, "moonshotN": 272, "pct": 5.1, "avg": 43.9}, "20": {"n": 5337, "moonshotN": 555, "pct": 10.4, "avg": 52.8}},
-    "強勢突破盤 ＋ 創52週新高 ＋ 突破飆股大量黑K最高點剛形成": {"10": {"n": 891, "moonshotN": 49, "pct": 5.5, "avg": 46.0}, "20": {"n": 891, "moonshotN": 93, "pct": 10.4, "avg": 52.5}},
-    "布林通道高檔(≥80%) ＋ 地量(≤0.5倍均量) ＋ 距52週高點≤5%": {"10": {"n": 1591, "moonshotN": 73, "pct": 4.6, "avg": 44.1}, "20": {"n": 1589, "moonshotN": 165, "pct": 10.4, "avg": 51.4}},
-    "相對強弱為負(弱於大盤) ＋ 近3月均價YoY為負 ＋ 夜星剛形成": {"10": {"n": 115, "moonshotN": 2, "pct": 1.7, "avg": 31.9}, "20": {"n": 115, "moonshotN": 12, "pct": 10.4, "avg": 47.5}},
-    "爆量(≥1.5倍均量) ＋ 創52週新高 ＋ 近3月均價YoY為負": {"10": {"n": 2815, "moonshotN": 155, "pct": 5.5, "avg": 45.3}, "20": {"n": 2814, "moonshotN": 292, "pct": 10.4, "avg": 51.9}},
-    "爆量(≥2倍均量) ＋ 創52週新高 ＋ N字底剛形成": {"10": {"n": 300, "moonshotN": 17, "pct": 5.7, "avg": 44.4}, "20": {"n": 299, "moonshotN": 31, "pct": 10.4, "avg": 54.8}},
-    "爆量(≥2倍均量) ＋ 創52週新高 ＋ 突破ABC修正下降切線剛形成": {"10": {"n": 500, "moonshotN": 30, "pct": 6.0, "avg": 40.8}, "20": {"n": 500, "moonshotN": 52, "pct": 10.4, "avg": 48.7}},
-    "爆量(≥2倍均量) ＋ 均線多頭排列(5>20>60且站上月線) ＋ 母子懷抱(低檔)剛形成": {"10": {"n": 144, "moonshotN": 8, "pct": 5.6, "avg": 42.3}, "20": {"n": 144, "moonshotN": 15, "pct": 10.4, "avg": 56.7}},
-    "地量(≤0.5倍均量) ＋ 量能斜率轉弱(近5日均量<近10日均量20%以上) ＋ 母子懷抱(高檔)剛形成": {"10": {"n": 173, "moonshotN": 9, "pct": 5.2, "avg": 49.8}, "20": {"n": 173, "moonshotN": 18, "pct": 10.4, "avg": 54.7}},
-    "量能斜率轉強(近5日均量>近10日均量20%以上) ＋ 創52週新高 ＋ 三大法人近3月賣超": {"10": {"n": 1497, "moonshotN": 93, "pct": 6.2, "avg": 44.6}, "20": {"n": 1497, "moonshotN": 155, "pct": 10.4, "avg": 55.5}},
-    "量能斜率轉強(近5日均量>近10日均量20%以上) ＋ 創52週新高 ＋ 突破ABC修正下降切線剛形成": {"10": {"n": 566, "moonshotN": 34, "pct": 6.0, "avg": 45.1}, "20": {"n": 566, "moonshotN": 59, "pct": 10.4, "avg": 51.6}},
-    "量能斜率轉弱(近5日均量<近10日均量20%以上) ＋ 創52週新高 ＋ 近3月均價YoY為正": {"10": {"n": 979, "moonshotN": 58, "pct": 5.9, "avg": 42.0}, "20": {"n": 979, "moonshotN": 102, "pct": 10.4, "avg": 55.4}},
-    "量能斜率轉弱(近5日均量<近10日均量20%以上) ＋ 距52週高點≤5% ＋ K線橫盤的突破剛形成": {"10": {"n": 134, "moonshotN": 9, "pct": 6.7, "avg": 40.5}, "20": {"n": 134, "moonshotN": 14, "pct": 10.4, "avg": 47.6}},
-    "大盤站上20日均線 ＋ 創52週新高 ＋ 近3月均價YoY為負": {"10": {"n": 3039, "moonshotN": 149, "pct": 4.9, "avg": 45.0}, "20": {"n": 3038, "moonshotN": 315, "pct": 10.4, "avg": 50.6}},
-    "大盤站上20日均線 ＋ 距52週高點≤5% ＋ 突破飆股大量黑K最高點剛形成": {"10": {"n": 1169, "moonshotN": 63, "pct": 5.4, "avg": 47.4}, "20": {"n": 1169, "moonshotN": 122, "pct": 10.4, "avg": 54.0}},
-    "大盤站上60日均線 ＋ 距52週高點≤5% ＋ 近3日向上跳空缺口": {"10": {"n": 7750, "moonshotN": 401, "pct": 5.2, "avg": 44.4}, "20": {"n": 7748, "moonshotN": 802, "pct": 10.4, "avg": 52.0}},
-    "回後買上漲全通過 ＋ 創52週新高 ＋ 近3月均價YoY為正": {"10": {"n": 3182, "moonshotN": 178, "pct": 5.6, "avg": 43.3}, "20": {"n": 3182, "moonshotN": 330, "pct": 10.4, "avg": 51.5}},
-    "回後買上漲全通過 ＋ 近3日向上跳空缺口 ＋ 突破ABC修正下降切線剛形成": {"10": {"n": 288, "moonshotN": 21, "pct": 7.3, "avg": 46.4}, "20": {"n": 288, "moonshotN": 30, "pct": 10.4, "avg": 53.6}},
-    "創52週新高 ＋ 均線多頭排列(5>20>60且站上月線) ＋ 近3月均價YoY為負": {"10": {"n": 3668, "moonshotN": 189, "pct": 5.2, "avg": 45.0}, "20": {"n": 3667, "moonshotN": 381, "pct": 10.4, "avg": 50.8}},
-    "距52週高點≤5% ＋ 近3月乖離度為正(營收優於股價) ＋ 晨星剛形成": {"10": {"n": 173, "moonshotN": 10, "pct": 5.8, "avg": 45.2}, "20": {"n": 173, "moonshotN": 18, "pct": 10.4, "avg": 51.4}},
-    "距52週高點≤5% ＋ 近3月均價YoY為負 ＋ N字底剛形成": {"10": {"n": 279, "moonshotN": 13, "pct": 4.7, "avg": 49.6}, "20": {"n": 278, "moonshotN": 29, "pct": 10.4, "avg": 50.8}},
-    "創52週新高 ＋ 近3月均價YoY為負": {"10": {"n": 3800, "moonshotN": 196, "pct": 5.2, "avg": 45.1}, "20": {"n": 3799, "moonshotN": 392, "pct": 10.3, "avg": 51.0}},
-    "多方力道≥65 ＋ 大盤站上60日均線 ＋ 創52週新高": {"10": {"n": 12350, "moonshotN": 652, "pct": 5.3, "avg": 44.4}, "20": {"n": 12354, "moonshotN": 1267, "pct": 10.3, "avg": 51.8}},
-    "多方力道≥65 ＋ 回後買上漲全通過 ＋ 距52週高點≤5%": {"10": {"n": 4416, "moonshotN": 263, "pct": 6.0, "avg": 43.3}, "20": {"n": 4416, "moonshotN": 456, "pct": 10.3, "avg": 51.4}},
-    "多方力道≥65 ＋ 回後買上漲全通過 ＋ 近3日向上跳空缺口": {"10": {"n": 2452, "moonshotN": 135, "pct": 5.5, "avg": 44.4}, "20": {"n": 2452, "moonshotN": 252, "pct": 10.3, "avg": 52.1}},
-    "多方力道≥80 ＋ 強勢突破盤 ＋ 創52週新高": {"10": {"n": 6231, "moonshotN": 336, "pct": 5.4, "avg": 43.7}, "20": {"n": 6232, "moonshotN": 644, "pct": 10.3, "avg": 50.6}},
-    "多方力道≥80 ＋ 相對強弱為正(強於大盤) ＋ 創52週新高": {"10": {"n": 9780, "moonshotN": 500, "pct": 5.1, "avg": 43.2}, "20": {"n": 9781, "moonshotN": 1005, "pct": 10.3, "avg": 50.2}},
-    "多方力道≥80 ＋ 回後買上漲全通過 ＋ 均線多頭排列(5>20>60且站上月線)": {"10": {"n": 4319, "moonshotN": 242, "pct": 5.6, "avg": 43.0}, "20": {"n": 4319, "moonshotN": 447, "pct": 10.3, "avg": 51.3}},
-    "多方力道≥80 ＋ 創52週新高 ＋ 突破ABC修正下降切線剛形成": {"10": {"n": 465, "moonshotN": 33, "pct": 7.1, "avg": 41.4}, "20": {"n": 465, "moonshotN": 48, "pct": 10.3, "avg": 51.3}},
-    "布林通道高檔(≥80%) ＋ 距52週高點≤5% ＋ 近3日向上跳空缺口": {"10": {"n": 8030, "moonshotN": 412, "pct": 5.1, "avg": 44.4}, "20": {"n": 8029, "moonshotN": 824, "pct": 10.3, "avg": 51.6}},
-    "MACD近3日內黃金交叉 ＋ 創52週新高 ＋ 近3日向上跳空缺口": {"10": {"n": 1663, "moonshotN": 89, "pct": 5.4, "avg": 46.0}, "20": {"n": 1663, "moonshotN": 171, "pct": 10.3, "avg": 52.8}},
-    "KDJ近3日內黃金交叉 ＋ 距52週高點≤5% ＋ 晨星剛形成": {"10": {"n": 204, "moonshotN": 15, "pct": 7.4, "avg": 47.1}, "20": {"n": 204, "moonshotN": 21, "pct": 10.3, "avg": 54.6}},
-    "爆量(≥2倍均量) ＋ 創52週新高 ＋ 近3日向上跳空缺口": {"10": {"n": 3446, "moonshotN": 194, "pct": 5.6, "avg": 46.6}, "20": {"n": 3447, "moonshotN": 355, "pct": 10.3, "avg": 54.1}},
-    "爆量(≥2倍均量) ＋ 創52週新高 ＋ 三大法人近3月賣超": {"10": {"n": 1369, "moonshotN": 82, "pct": 6.0, "avg": 44.7}, "20": {"n": 1369, "moonshotN": 141, "pct": 10.3, "avg": 53.2}},
-    "量能區間高檔(≥90百分位) ＋ 量能斜率轉弱(近5日均量<近10日均量20%以上) ＋ 母子懷抱(低檔)剛形成": {"10": {"n": 97, "moonshotN": 6, "pct": 6.2, "avg": 51.0}, "20": {"n": 97, "moonshotN": 10, "pct": 10.3, "avg": 64.9}},
-    "量能區間高檔(≥90百分位) ＋ 距52週高點≤5% ＋ N字底剛形成": {"10": {"n": 747, "moonshotN": 44, "pct": 5.9, "avg": 44.3}, "20": {"n": 746, "moonshotN": 77, "pct": 10.3, "avg": 50.4}},
-    "量能斜率轉弱(近5日均量<近10日均量20%以上) ＋ 創52週新高 ＋ 近3月乖離度為正(營收優於股價)": {"10": {"n": 526, "moonshotN": 25, "pct": 4.8, "avg": 39.3}, "20": {"n": 526, "moonshotN": 54, "pct": 10.3, "avg": 44.7}},
-    "大盤站上60日均線 ＋ 距52週高點≤5% ＋ 突破飆股大量黑K最高點剛形成": {"10": {"n": 1313, "moonshotN": 71, "pct": 5.4, "avg": 46.7}, "20": {"n": 1313, "moonshotN": 135, "pct": 10.3, "avg": 54.0}},
-    "回後買上漲全通過 ＋ 創52週新高 ＋ 近3月乖離度為負(股價超前營收)": {"10": {"n": 2214, "moonshotN": 122, "pct": 5.5, "avg": 44.9}, "20": {"n": 2214, "moonshotN": 229, "pct": 10.3, "avg": 52.5}},
-    "回後買上漲全通過 ＋ 均線多頭排列(5>20>60且站上月線) ＋ 晨星剛形成": {"10": {"n": 263, "moonshotN": 15, "pct": 5.7, "avg": 41.5}, "20": {"n": 263, "moonshotN": 27, "pct": 10.3, "avg": 52.2}},
-    "回後買上漲全通過 ＋ 近3月乖離度為負(股價超前營收) ＋ 晨星剛形成": {"10": {"n": 194, "moonshotN": 10, "pct": 5.2, "avg": 45.4}, "20": {"n": 194, "moonshotN": 20, "pct": 10.3, "avg": 51.5}},
-    "創52週新高 ＋ 均線多頭排列(5>20>60且站上月線) ＋ 突破飆股大量黑K最高點剛形成": {"10": {"n": 1021, "moonshotN": 58, "pct": 5.7, "avg": 46.1}, "20": {"n": 1021, "moonshotN": 105, "pct": 10.3, "avg": 55.0}},
-    "創52週新高 ＋ 三大法人近3月買超 ＋ N字底剛形成": {"10": {"n": 737, "moonshotN": 43, "pct": 5.8, "avg": 43.3}, "20": {"n": 736, "moonshotN": 76, "pct": 10.3, "avg": 51.9}},
-    "多方力道≥80 ＋ 回後買上漲全通過": {"10": {"n": 4580, "moonshotN": 255, "pct": 5.6, "avg": 42.8}, "20": {"n": 4580, "moonshotN": 466, "pct": 10.2, "avg": 51.2}},
-    "近3月乖離度為負(股價超前營收) ＋ 晨星剛形成": {"10": {"n": 1157, "moonshotN": 53, "pct": 4.6, "avg": 44.1}, "20": {"n": 1157, "moonshotN": 118, "pct": 10.2, "avg": 49.8}},
-    "多方力道≥65 ＋ 相對強弱為正(強於大盤) ＋ 創52週新高": {"10": {"n": 12807, "moonshotN": 670, "pct": 5.2, "avg": 44.3}, "20": {"n": 12809, "moonshotN": 1311, "pct": 10.2, "avg": 51.5}},
-    "多方力道≥65 ＋ 回後買上漲全通過 ＋ 晨星剛形成": {"10": {"n": 225, "moonshotN": 15, "pct": 6.7, "avg": 41.8}, "20": {"n": 225, "moonshotN": 23, "pct": 10.2, "avg": 52.2}},
-    "多方力道≥65 ＋ 創52週新高 ＋ 突破ABC修正下降切線剛形成": {"10": {"n": 729, "moonshotN": 44, "pct": 6.0, "avg": 45.8}, "20": {"n": 729, "moonshotN": 74, "pct": 10.2, "avg": 52.2}},
-    "多方力道≥65 ＋ 均線多頭排列(5>20>60且站上月線) ＋ 母子懷抱(低檔)剛形成": {"10": {"n": 746, "moonshotN": 39, "pct": 5.2, "avg": 42.6}, "20": {"n": 746, "moonshotN": 76, "pct": 10.2, "avg": 51.6}},
-    "多方力道≥80 ＋ 布林通道高檔(≥80%) ＋ 回後買上漲全通過": {"10": {"n": 4523, "moonshotN": 249, "pct": 5.5, "avg": 42.7}, "20": {"n": 4523, "moonshotN": 460, "pct": 10.2, "avg": 51.1}},
-    "多方力道≥80 ＋ 量能區間高檔(≥90百分位) ＋ 回後買上漲全通過": {"10": {"n": 3541, "moonshotN": 209, "pct": 5.9, "avg": 43.2}, "20": {"n": 3541, "moonshotN": 361, "pct": 10.2, "avg": 51.0}},
-    "多方力道≥80 ＋ 大盤站上60日均線 ＋ 近3日向上跳空缺口": {"10": {"n": 8102, "moonshotN": 409, "pct": 5.0, "avg": 43.5}, "20": {"n": 8100, "moonshotN": 823, "pct": 10.2, "avg": 51.9}},
-    "多方力道≥80 ＋ 創52週新高 ＋ 三大法人近3月賣超": {"10": {"n": 1717, "moonshotN": 99, "pct": 5.8, "avg": 43.7}, "20": {"n": 1717, "moonshotN": 175, "pct": 10.2, "avg": 51.6}},
-    "多方力道≥80 ＋ 近3日向上跳空缺口 ＋ 三大法人近3月買超": {"10": {"n": 6626, "moonshotN": 309, "pct": 4.7, "avg": 43.9}, "20": {"n": 6625, "moonshotN": 675, "pct": 10.2, "avg": 51.6}},
-    "KDJ近3日內死亡交叉 ＋ 距52週高點≤5% ＋ 晨星剛形成": {"10": {"n": 187, "moonshotN": 11, "pct": 5.9, "avg": 44.3}, "20": {"n": 187, "moonshotN": 19, "pct": 10.2, "avg": 46.9}},
-    "相對強弱為正(強於大盤) ＋ 大盤站上20日均線 ＋ 創52週新高": {"10": {"n": 11970, "moonshotN": 619, "pct": 5.2, "avg": 44.4}, "20": {"n": 11970, "moonshotN": 1224, "pct": 10.2, "avg": 51.1}},
-    "相對強弱為正(強於大盤) ＋ 回後買上漲全通過 ＋ 距52週高點≤5%": {"10": {"n": 5050, "moonshotN": 291, "pct": 5.8, "avg": 43.5}, "20": {"n": 5049, "moonshotN": 516, "pct": 10.2, "avg": 51.5}},
-    "爆量(≥1.5倍均量) ＋ 回後買上漲全通過 ＋ 創52週新高": {"10": {"n": 2821, "moonshotN": 164, "pct": 5.8, "avg": 43.6}, "20": {"n": 2820, "moonshotN": 289, "pct": 10.2, "avg": 50.7}},
-    "量能區間高檔(≥90百分位) ＋ 創52週新高 ＋ 三大法人近3月賣超": {"10": {"n": 2061, "moonshotN": 123, "pct": 6.0, "avg": 44.0}, "20": {"n": 2061, "moonshotN": 211, "pct": 10.2, "avg": 51.9}},
-    "量能斜率轉弱(近5日均量<近10日均量20%以上) ＋ 回後買上漲全通過 ＋ 均線多頭排列(5>20>60且站上月線)": {"10": {"n": 705, "moonshotN": 41, "pct": 5.8, "avg": 42.9}, "20": {"n": 705, "moonshotN": 72, "pct": 10.2, "avg": 54.6}},
-    "大盤站上20日均線 ＋ 創52週新高 ＋ 三大法人近3月賣超": {"10": {"n": 2114, "moonshotN": 122, "pct": 5.8, "avg": 45.1}, "20": {"n": 2114, "moonshotN": 216, "pct": 10.2, "avg": 53.2}},
-    "回後買上漲全通過 ＋ 近3日向上跳空缺口 ＋ 三大法人近3月買超": {"10": {"n": 2587, "moonshotN": 128, "pct": 4.9, "avg": 43.8}, "20": {"n": 2587, "moonshotN": 264, "pct": 10.2, "avg": 50.8}},
-    "回後買上漲全通過 ＋ 母子懷抱(低檔)剛形成 ＋ 晨星剛形成": {"10": {"n": 128, "moonshotN": 6, "pct": 4.7, "avg": 37.2}, "20": {"n": 128, "moonshotN": 13, "pct": 10.2, "avg": 46.6}},
-    "創52週新高 ＋ 近3月均價YoY為負 ＋ 三大法人近3月買超": {"10": {"n": 3054, "moonshotN": 149, "pct": 4.9, "avg": 45.5}, "20": {"n": 3053, "moonshotN": 310, "pct": 10.2, "avg": 52.3}},
-    "距52週高點≤5% ＋ 突破ABC修正下降切線剛形成 ＋ 突破飆股大量黑K最高點剛形成": {"10": {"n": 275, "moonshotN": 14, "pct": 5.1, "avg": 45.5}, "20": {"n": 275, "moonshotN": 28, "pct": 10.2, "avg": 49.9}},
-    "均線多頭排列(5>20>60且站上月線) ＋ 近3日向上跳空缺口 ＋ 突破飆股大量黑K最高點剛形成": {"10": {"n": 591, "moonshotN": 27, "pct": 4.6, "avg": 45.8}, "20": {"n": 591, "moonshotN": 60, "pct": 10.2, "avg": 53.3}},
-    "均線多頭排列(5>20>60且站上月線) ＋ 近3月乖離度為正(營收優於股價) ＋ 晨星剛形成": {"10": {"n": 384, "moonshotN": 19, "pct": 4.9, "avg": 42.5}, "20": {"n": 384, "moonshotN": 39, "pct": 10.2, "avg": 49.1}},
-    "近3日向上跳空缺口 ＋ 近3月均價YoY為正 ＋ 突破飆股大量黑K最高點剛形成": {"10": {"n": 461, "moonshotN": 18, "pct": 3.9, "avg": 44.8}, "20": {"n": 461, "moonshotN": 47, "pct": 10.2, "avg": 51.7}},
-    "多方力道≥65 ＋ 大盤站上20日均線 ＋ 創52週新高": {"10": {"n": 11322, "moonshotN": 580, "pct": 5.1, "avg": 44.3}, "20": {"n": 11325, "moonshotN": 1139, "pct": 10.1, "avg": 51.1}},
-    "多方力道≥80 ＋ 強勢突破盤 ＋ 回後買上漲全通過": {"10": {"n": 3281, "moonshotN": 184, "pct": 5.6, "avg": 43.7}, "20": {"n": 3281, "moonshotN": 332, "pct": 10.1, "avg": 52.3}},
-    "多方力道≥80 ＋ 強勢突破盤 ＋ 近3日向上跳空缺口": {"10": {"n": 5092, "moonshotN": 268, "pct": 5.3, "avg": 44.3}, "20": {"n": 5092, "moonshotN": 514, "pct": 10.1, "avg": 51.0}},
-    "多方力道≥80 ＋ 布林通道高檔(≥80%) ＋ 創52週新高": {"10": {"n": 9816, "moonshotN": 491, "pct": 5.0, "avg": 43.1}, "20": {"n": 9817, "moonshotN": 989, "pct": 10.1, "avg": 49.9}},
-    "布林通道高檔(≥80%) ＋ 創52週新高 ＋ 近3月均價YoY為負": {"10": {"n": 3633, "moonshotN": 184, "pct": 5.1, "avg": 45.0}, "20": {"n": 3632, "moonshotN": 368, "pct": 10.1, "avg": 50.9}},
-    "MACD近3日內黃金交叉 ＋ 量能區間高檔(≥90百分位) ＋ N字底剛形成": {"10": {"n": 159, "moonshotN": 8, "pct": 5.0, "avg": 43.3}, "20": {"n": 159, "moonshotN": 16, "pct": 10.1, "avg": 49.2}},
-    "MACD近3日內黃金交叉 ＋ 近3日向上跳空缺口 ＋ 突破飆股大量黑K最高點剛形成": {"10": {"n": 138, "moonshotN": 6, "pct": 4.3, "avg": 45.1}, "20": {"n": 138, "moonshotN": 14, "pct": 10.1, "avg": 52.6}},
-    "KDJ近3日內黃金交叉 ＋ 創52週新高 ＋ 三大法人近3月賣超": {"10": {"n": 946, "moonshotN": 49, "pct": 5.2, "avg": 41.9}, "20": {"n": 946, "moonshotN": 96, "pct": 10.1, "avg": 48.5}},
-    "相對強弱為正(強於大盤) ＋ 創52週新高 ＋ 三大法人近3月賣超": {"10": {"n": 2419, "moonshotN": 146, "pct": 6.0, "avg": 44.6}, "20": {"n": 2419, "moonshotN": 244, "pct": 10.1, "avg": 53.4}},
-    "爆量(≥1.5倍均量) ＋ 創52週新高 ＋ 突破ABC修正下降切線剛形成": {"10": {"n": 703, "moonshotN": 39, "pct": 5.5, "avg": 43.2}, "20": {"n": 703, "moonshotN": 71, "pct": 10.1, "avg": 50.9}},
-    "量能區間高檔(≥90百分位) ＋ 均線多頭排列(5>20>60且站上月線) ＋ 晨星剛形成": {"10": {"n": 575, "moonshotN": 36, "pct": 6.3, "avg": 44.7}, "20": {"n": 575, "moonshotN": 58, "pct": 10.1, "avg": 51.4}},
-    "量能區間高檔(≥90百分位) ＋ 圓弧底剛形成 ＋ 突破飆股大量黑K最高點剛形成": {"10": {"n": 258, "moonshotN": 13, "pct": 5.0, "avg": 42.0}, "20": {"n": 258, "moonshotN": 26, "pct": 10.1, "avg": 52.0}},
-    "量能斜率轉強(近5日均量>近10日均量20%以上) ＋ 大盤站上60日均線 ＋ 創52週新高": {"10": {"n": 7438, "moonshotN": 390, "pct": 5.2, "avg": 45.7}, "20": {"n": 7439, "moonshotN": 752, "pct": 10.1, "avg": 53.5}},
-    "量能斜率轉強(近5日均量>近10日均量20%以上) ＋ 創52週新高 ＋ 突破飆股大量黑K最高點剛形成": {"10": {"n": 830, "moonshotN": 45, "pct": 5.4, "avg": 45.1}, "20": {"n": 830, "moonshotN": 84, "pct": 10.1, "avg": 53.2}},
-    "大盤站上20日均線 ＋ 回後買上漲全通過 ＋ 距52週高點≤5%": {"10": {"n": 4600, "moonshotN": 257, "pct": 5.6, "avg": 43.5}, "20": {"n": 4599, "moonshotN": 463, "pct": 10.1, "avg": 50.5}},
-    "大盤跌破20日均線 ＋ 創52週新高 ＋ 近3月均價YoY為負": {"10": {"n": 761, "moonshotN": 47, "pct": 6.2, "avg": 45.1}, "20": {"n": 761, "moonshotN": 77, "pct": 10.1, "avg": 52.6}},
-    "大盤站上60日均線 ＋ 回後買上漲全通過 ＋ 距52週高點≤5%": {"10": {"n": 4928, "moonshotN": 281, "pct": 5.7, "avg": 43.5}, "20": {"n": 4927, "moonshotN": 500, "pct": 10.1, "avg": 51.5}},
-    "大盤站上60日均線 ＋ 回後買上漲全通過 ＋ 母子懷抱(低檔)剛形成": {"10": {"n": 148, "moonshotN": 6, "pct": 4.1, "avg": 38.2}, "20": {"n": 148, "moonshotN": 15, "pct": 10.1, "avg": 50.1}},
-    "大盤站上60日均線 ＋ 近3日向上跳空缺口 ＋ 母子懷抱(低檔)剛形成": {"10": {"n": 326, "moonshotN": 18, "pct": 5.5, "avg": 41.4}, "20": {"n": 326, "moonshotN": 33, "pct": 10.1, "avg": 57.9}},
-    "回後買上漲全通過 ＋ 距52週高點≤5% ＋ N字底剛形成": {"10": {"n": 753, "moonshotN": 44, "pct": 5.8, "avg": 45.1}, "20": {"n": 752, "moonshotN": 76, "pct": 10.1, "avg": 51.7}},
+    "量能斜率轉弱(近5日均量<近10日均量20%以上) ＋ 創52週新高 ＋ N字底剛形成": {"10": {"n": 168, "moonshotN": 13, "pct": 7.7, "avg": 39.7}, "20": {"n": 168, "moonshotN": 20, "pct": 11.9, "avg": 52.5}},
+    "多方力道≥80 ＋ 創52週新高 ＋ 近3月乖離度為正(營收優於股價)": {"10": {"n": 4569, "moonshotN": 224, "pct": 4.9, "avg": 43.6}, "20": {"n": 4569, "moonshotN": 474, "pct": 10.4, "avg": 50.3}},
+    "多方力道≥65 ＋ 距52週高點≤5% ＋ 晨星剛形成": {"10": {"n": 300, "moonshotN": 24, "pct": 8.0, "avg": 45.9}, "20": {"n": 300, "moonshotN": 40, "pct": 13.3, "avg": 50.1}},
+    "大盤站上20日均線 ＋ 創52週新高 ＋ N字底剛形成": {"10": {"n": 643, "moonshotN": 45, "pct": 7.0, "avg": 44.1}, "20": {"n": 643, "moonshotN": 81, "pct": 12.6, "avg": 50.5}},
+    "大盤站上20日均線 ＋ 創52週新高 ＋ 近3日向上跳空缺口": {"10": {"n": 5125, "moonshotN": 318, "pct": 6.2, "avg": 45.3}, "20": {"n": 5125, "moonshotN": 634, "pct": 12.4, "avg": 51.8}},
+    "創52週新高 ＋ DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR) ＋ N字底剛形成": {"10": {"n": 637, "moonshotN": 44, "pct": 6.9, "avg": 43.2}, "20": {"n": 637, "moonshotN": 75, "pct": 11.8, "avg": 50.6}},
+    "量能區間高檔(≥90百分位) ＋ 創52週新高 ＋ 近3月乖離度為正(營收優於股價)": {"10": {"n": 5401, "moonshotN": 296, "pct": 5.5, "avg": 45.1}, "20": {"n": 5401, "moonshotN": 565, "pct": 10.5, "avg": 52.0}},
+    "大盤站上20日均線 ＋ DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR) ＋ 晨星剛形成": {"10": {"n": 447, "moonshotN": 34, "pct": 7.6, "avg": 43.7}, "20": {"n": 447, "moonshotN": 64, "pct": 14.3, "avg": 53.3}},
+    "量能斜率轉弱(近5日均量<近10日均量20%以上) ＋ 距52週高點≤5% ＋ 近3日向上跳空缺口": {"10": {"n": 745, "moonshotN": 45, "pct": 6.0, "avg": 42.6}, "20": {"n": 745, "moonshotN": 97, "pct": 13.0, "avg": 54.2}},
+    "距52週高點≤5% ＋ 晨星剛形成": {"10": {"n": 392, "moonshotN": 30, "pct": 7.7, "avg": 45.2}, "20": {"n": 392, "moonshotN": 56, "pct": 14.3, "avg": 50.2}},
+    "創52週新高 ＋ 近3日向上跳空缺口 ＋ DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR)": {"10": {"n": 3987, "moonshotN": 270, "pct": 6.8, "avg": 44.8}, "20": {"n": 3987, "moonshotN": 533, "pct": 13.4, "avg": 52.6}},
+    "多方力道≥80 ＋ 創52週新高 ＋ 近3日向上跳空缺口": {"10": {"n": 3816, "moonshotN": 253, "pct": 6.6, "avg": 44.5}, "20": {"n": 3816, "moonshotN": 501, "pct": 13.1, "avg": 52.3}},
+    "強勢突破盤 ＋ DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR) ＋ 晨星剛形成": {"10": {"n": 231, "moonshotN": 13, "pct": 5.6, "avg": 49.3}, "20": {"n": 231, "moonshotN": 28, "pct": 12.1, "avg": 50.9}},
+    "多方力道≥65 ＋ 創52週新高 ＋ N字底剛形成": {"10": {"n": 703, "moonshotN": 47, "pct": 6.7, "avg": 43.9}, "20": {"n": 703, "moonshotN": 81, "pct": 11.5, "avg": 50.9}},
+    "KDJ近3日內黃金交叉 ＋ 創52週新高 ＋ N字底剛形成": {"10": {"n": 564, "moonshotN": 40, "pct": 7.1, "avg": 43.0}, "20": {"n": 564, "moonshotN": 69, "pct": 12.2, "avg": 52.8}},
+    "多方力道≥80 ＋ 連續放量(近3日均量≥1.5倍前20日均量) ＋ 晨星剛形成": {"10": {"n": 152, "moonshotN": 11, "pct": 7.2, "avg": 48.6}, "20": {"n": 152, "moonshotN": 18, "pct": 11.8, "avg": 53.9}},
+    "DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR) ＋ 突破ABC修正下降切線剛形成 ＋ 突破飆股大量黑K最高點剛形成": {"10": {"n": 237, "moonshotN": 19, "pct": 8.0, "avg": 46.3}, "20": {"n": 237, "moonshotN": 28, "pct": 11.8, "avg": 53.2}},
+    "相對強弱為正(強於大盤) ＋ 創52週新高 ＋ 突破ABC修正下降切線剛形成": {"10": {"n": 908, "moonshotN": 53, "pct": 5.8, "avg": 46.3}, "20": {"n": 908, "moonshotN": 98, "pct": 10.8, "avg": 52.1}},
+    "近3日向上跳空缺口 ＋ 投信連續買超≥3日 ＋ 突破ABC修正下降切線剛形成": {"10": {"n": 143, "moonshotN": 5, "pct": 3.5, "avg": 41.7}, "20": {"n": 143, "moonshotN": 15, "pct": 10.5, "avg": 43.6}},
+    "布林通道高檔(≥80%) ＋ 距52週高點≤5% ＋ 晨星剛形成": {"10": {"n": 367, "moonshotN": 28, "pct": 7.6, "avg": 44.5}, "20": {"n": 367, "moonshotN": 53, "pct": 14.4, "avg": 50.3}},
+    "距52週高點≤5% ＋ 外資近5日買超 ＋ 晨星剛形成": {"10": {"n": 264, "moonshotN": 22, "pct": 8.3, "avg": 46.2}, "20": {"n": 264, "moonshotN": 36, "pct": 13.6, "avg": 49.4}},
+    "量能區間高檔(≥90百分位) ＋ 量能斜率轉弱(近5日均量<近10日均量20%以上) ＋ 近3日向上跳空缺口": {"10": {"n": 717, "moonshotN": 38, "pct": 5.3, "avg": 43.6}, "20": {"n": 717, "moonshotN": 84, "pct": 11.7, "avg": 53.4}},
+    "DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR) ＋ 母子懷抱(低檔)剛形成 ＋ 晨星剛形成": {"10": {"n": 162, "moonshotN": 14, "pct": 8.6, "avg": 43.8}, "20": {"n": 162, "moonshotN": 18, "pct": 11.1, "avg": 57.8}},
+    "創52週新高 ＋ 近3月乖離度為正(營收優於股價) ＋ DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR)": {"10": {"n": 4872, "moonshotN": 240, "pct": 4.9, "avg": 43.8}, "20": {"n": 4872, "moonshotN": 504, "pct": 10.3, "avg": 50.5}},
+    "爆量(≥2倍均量) ＋ 創52週新高 ＋ 三大法人近3月賣超": {"10": {"n": 1281, "moonshotN": 78, "pct": 6.1, "avg": 44.8}, "20": {"n": 1281, "moonshotN": 131, "pct": 10.2, "avg": 52.8}},
+    "大盤站上20日均線 ＋ 創52週新高 ＋ 三大法人近3月賣超": {"10": {"n": 1999, "moonshotN": 117, "pct": 5.9, "avg": 45.2}, "20": {"n": 1999, "moonshotN": 203, "pct": 10.2, "avg": 52.8}},
+    "距52週高點≤5% ＋ 近3月乖離度為負(股價超前營收) ＋ 晨星剛形成": {"10": {"n": 208, "moonshotN": 17, "pct": 8.2, "avg": 46.3}, "20": {"n": 208, "moonshotN": 32, "pct": 15.4, "avg": 49.6}},
+    "多方力道≥80 ＋ 量能斜率轉弱(近5日均量<近10日均量20%以上) ＋ 近3日向上跳空缺口": {"10": {"n": 1103, "moonshotN": 82, "pct": 7.4, "avg": 42.7}, "20": {"n": 1103, "moonshotN": 153, "pct": 13.9, "avg": 56.8}},
+    "大盤站上20日均線 ＋ 創52週新高 ＋ 突破飆股大量黑K最高點剛形成": {"10": {"n": 813, "moonshotN": 52, "pct": 6.4, "avg": 46.2}, "20": {"n": 813, "moonshotN": 97, "pct": 11.9, "avg": 53.7}},
+    "連續放量(近3日均量≥1.5倍前20日均量) ＋ DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR) ＋ 突破ABC修正下降切線剛形成": {"10": {"n": 651, "moonshotN": 44, "pct": 6.8, "avg": 46.7}, "20": {"n": 651, "moonshotN": 72, "pct": 11.1, "avg": 51.3}},
+    "爆量(≥1.5倍均量) ＋ 均線多頭排列(5>20>60且站上月線) ＋ 母子懷抱(低檔)剛形成": {"10": {"n": 259, "moonshotN": 17, "pct": 6.6, "avg": 44.7}, "20": {"n": 259, "moonshotN": 27, "pct": 10.4, "avg": 52.1}},
+    "多方力道≥80 ＋ 大盤站上20日均線 ＋ 突破飆股大量黑K最高點剛形成": {"10": {"n": 1079, "moonshotN": 60, "pct": 5.6, "avg": 45.5}, "20": {"n": 1079, "moonshotN": 109, "pct": 10.1, "avg": 54.6}},
+    "大盤站上20日均線 ＋ 創52週新高 ＋ 近3月乖離度為正(營收優於股價)": {"10": {"n": 5483, "moonshotN": 274, "pct": 5.0, "avg": 45.0}, "20": {"n": 5483, "moonshotN": 553, "pct": 10.1, "avg": 51.0}},
+    "相對強弱為正(強於大盤) ＋ DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR) ＋ 晨星剛形成": {"10": {"n": 545, "moonshotN": 35, "pct": 6.4, "avg": 43.9}, "20": {"n": 545, "moonshotN": 72, "pct": 13.2, "avg": 51.3}},
+    "創52週新高 ＋ 近3日向上跳空缺口 ＋ 近3月均價YoY為負": {"10": {"n": 1704, "moonshotN": 121, "pct": 7.1, "avg": 45.4}, "20": {"n": 1704, "moonshotN": 215, "pct": 12.6, "avg": 53.0}},
+    "多方力道≥80 ＋ 距52週高點≤5% ＋ N字底剛形成": {"10": {"n": 716, "moonshotN": 46, "pct": 6.4, "avg": 42.8}, "20": {"n": 716, "moonshotN": 83, "pct": 11.6, "avg": 48.6}},
+    "創52週新高 ＋ 連續放量(近3日均量≥1.5倍前20日均量) ＋ 近3月乖離度為正(營收優於股價)": {"10": {"n": 4296, "moonshotN": 254, "pct": 5.9, "avg": 45.6}, "20": {"n": 4296, "moonshotN": 458, "pct": 10.7, "avg": 53.1}},
+    "量能斜率轉強(近5日均量>近10日均量20%以上) ＋ 創52週新高 ＋ 三大法人近3月賣超": {"10": {"n": 1407, "moonshotN": 89, "pct": 6.3, "avg": 44.5}, "20": {"n": 1407, "moonshotN": 144, "pct": 10.2, "avg": 55.0}},
+    "創52週新高 ＋ 連續放量(近3日均量≥1.5倍前20日均量) ＋ 三大法人近3月賣超": {"10": {"n": 1648, "moonshotN": 100, "pct": 6.1, "avg": 45.2}, "20": {"n": 1648, "moonshotN": 167, "pct": 10.1, "avg": 52.8}},
+    "地量(≤0.5倍均量) ＋ 回後買上漲全通過 ＋ DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR)": {"10": {"n": 158, "moonshotN": 16, "pct": 10.1, "avg": 41.0}, "20": {"n": 158, "moonshotN": 28, "pct": 17.7, "avg": 61.2}},
+    "地量(≤0.5倍均量) ＋ DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR) ＋ 晨星剛形成": {"10": {"n": 64, "moonshotN": 6, "pct": 9.4, "avg": 37.7}, "20": {"n": 64, "moonshotN": 12, "pct": 18.8, "avg": 62.1}},
+    "量能區間低檔(≤10百分位) ＋ 創52週新高 ＋ 近3月乖離度為負(股價超前營收)": {"10": {"n": 65, "moonshotN": 3, "pct": 4.6, "avg": 31.4}, "20": {"n": 65, "moonshotN": 11, "pct": 16.9, "avg": 44.4}},
+    "相對強弱為正(強於大盤) ＋ 創52週新高 ＋ 母子懷抱(低檔)剛形成": {"10": {"n": 96, "moonshotN": 8, "pct": 8.3, "avg": 47.2}, "20": {"n": 96, "moonshotN": 15, "pct": 15.6, "avg": 61.8}},
+    "創52週新高 ＋ 母子懷抱(低檔)剛形成": {"10": {"n": 100, "moonshotN": 8, "pct": 8.0, "avg": 47.2}, "20": {"n": 100, "moonshotN": 15, "pct": 15.0, "avg": 61.8}},
+    "距52週高點≤5% ＋ 三大法人近3月買超 ＋ 晨星剛形成": {"10": {"n": 323, "moonshotN": 27, "pct": 8.4, "avg": 46.0}, "20": {"n": 323, "moonshotN": 48, "pct": 14.9, "avg": 48.6}},
+    "相對強弱為正(強於大盤) ＋ 距52週高點≤5% ＋ 晨星剛形成": {"10": {"n": 367, "moonshotN": 29, "pct": 7.9, "avg": 45.4}, "20": {"n": 367, "moonshotN": 54, "pct": 14.7, "avg": 50.8}},
+    "大盤跌破20日均線 ＋ 外資近5日買超 ＋ 夜星剛形成": {"10": {"n": 140, "moonshotN": 9, "pct": 6.4, "avg": 47.4}, "20": {"n": 140, "moonshotN": 20, "pct": 14.3, "avg": 56.1}},
+    "量能區間低檔(≤10百分位) ＋ 創52週新高": {"10": {"n": 78, "moonshotN": 4, "pct": 5.1, "avg": 31.2}, "20": {"n": 78, "moonshotN": 11, "pct": 14.1, "avg": 44.4}},
+    "量能區間低檔(≤10百分位) ＋ 創52週新高 ＋ 距52週高點≤5%": {"10": {"n": 72, "moonshotN": 4, "pct": 5.6, "avg": 31.2}, "20": {"n": 72, "moonshotN": 10, "pct": 13.9, "avg": 44.1}},
+    "均線多頭排列(5>20>60且站上月線) ＋ DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR) ＋ 晨星剛形成": {"10": {"n": 527, "moonshotN": 36, "pct": 6.8, "avg": 44.1}, "20": {"n": 527, "moonshotN": 71, "pct": 13.5, "avg": 52.3}},
+    "量能斜率轉弱(近5日均量<近10日均量20%以上) ＋ 創52週新高 ＋ 三大法人近3月賣超": {"10": {"n": 154, "moonshotN": 7, "pct": 4.5, "avg": 44.7}, "20": {"n": 154, "moonshotN": 20, "pct": 13.0, "avg": 44.4}},
+    "地量(≤0.5倍均量) ＋ 量能區間高檔(≥90百分位) ＋ 近3日向上跳空缺口": {"10": {"n": 135, "moonshotN": 7, "pct": 5.2, "avg": 44.3}, "20": {"n": 135, "moonshotN": 16, "pct": 11.9, "avg": 47.6}},
+    "創52週新高 ＋ 突破ABC修正下降切線剛形成 ＋ 突破飆股大量黑K最高點剛形成": {"10": {"n": 218, "moonshotN": 16, "pct": 7.3, "avg": 45.5}, "20": {"n": 218, "moonshotN": 26, "pct": 11.9, "avg": 51.7}},
+    "大盤跌破60日均線 ＋ 均線多頭排列(5>20>60且站上月線) ＋ 晨星剛形成": {"10": {"n": 122, "moonshotN": 7, "pct": 5.7, "avg": 39.5}, "20": {"n": 122, "moonshotN": 14, "pct": 11.5, "avg": 43.7}},
+    "爆量(≥2倍均量) ＋ 創52週新高 ＋ 突破ABC修正下降切線剛形成": {"10": {"n": 475, "moonshotN": 32, "pct": 6.7, "avg": 43.3}, "20": {"n": 475, "moonshotN": 54, "pct": 11.4, "avg": 51.5}},
+    "爆量(≥2倍均量) ＋ 大盤站上20日均線 ＋ 母子懷抱(低檔)剛形成": {"10": {"n": 191, "moonshotN": 10, "pct": 5.2, "avg": 45.0}, "20": {"n": 191, "moonshotN": 20, "pct": 10.5, "avg": 51.4}},
+    "多方力道≥80 ＋ 創52週新高 ＋ 三大法人近3月賣超": {"10": {"n": 1634, "moonshotN": 95, "pct": 5.8, "avg": 43.5}, "20": {"n": 1634, "moonshotN": 169, "pct": 10.3, "avg": 51.4}},
+    "量能區間高檔(≥90百分位) ＋ 創52週新高 ＋ 三大法人近3月賣超": {"10": {"n": 1947, "moonshotN": 119, "pct": 6.1, "avg": 43.9}, "20": {"n": 1947, "moonshotN": 199, "pct": 10.2, "avg": 51.3}},
+    "多方力道≥65 ＋ 創52週新高 ＋ 近3日向上跳空缺口": {"10": {"n": 5050, "moonshotN": 348, "pct": 6.9, "avg": 45.4}, "20": {"n": 5050, "moonshotN": 653, "pct": 12.9, "avg": 53.2}},
+    "量能斜率轉強(近5日均量>近10日均量20%以上) ＋ 均線多頭排列(5>20>60且站上月線) ＋ 晨星剛形成": {"10": {"n": 337, "moonshotN": 24, "pct": 7.1, "avg": 42.4}, "20": {"n": 337, "moonshotN": 41, "pct": 12.2, "avg": 49.3}},
+    "量能斜率轉強(近5日均量>近10日均量20%以上) ＋ 創52週新高 ＋ 突破ABC修正下降切線剛形成": {"10": {"n": 548, "moonshotN": 38, "pct": 6.9, "avg": 46.4}, "20": {"n": 548, "moonshotN": 64, "pct": 11.7, "avg": 52.6}},
+    "創52週新高 ＋ 外資近5日買超 ＋ N字底剛形成": {"10": {"n": 580, "moonshotN": 38, "pct": 6.6, "avg": 45.0}, "20": {"n": 580, "moonshotN": 65, "pct": 11.2, "avg": 52.8}},
+    "創52週新高 ＋ 均線多頭排列(5>20>60且站上月線) ＋ 突破ABC修正下降切線剛形成": {"10": {"n": 934, "moonshotN": 55, "pct": 5.9, "avg": 46.8}, "20": {"n": 934, "moonshotN": 101, "pct": 10.8, "avg": 52.8}},
+    "地量(≤0.5倍均量) ＋ 創52週新高 ＋ 外資近5日買超": {"10": {"n": 463, "moonshotN": 35, "pct": 7.6, "avg": 44.4}, "20": {"n": 463, "moonshotN": 79, "pct": 17.1, "avg": 53.5}},
+    "多方力道≥80 ＋ 回後買上漲全通過 ＋ 創52週新高": {"10": {"n": 2677, "moonshotN": 176, "pct": 6.6, "avg": 42.2}, "20": {"n": 2677, "moonshotN": 312, "pct": 11.7, "avg": 50.8}},
+    "相對強弱為正(強於大盤) ＋ 創52週新高 ＋ N字底剛形成": {"10": {"n": 729, "moonshotN": 49, "pct": 6.7, "avg": 44.4}, "20": {"n": 729, "moonshotN": 83, "pct": 11.4, "avg": 51.8}},
+    "創52週新高 ＋ 均線多頭排列(5>20>60且站上月線) ＋ N字底剛形成": {"10": {"n": 767, "moonshotN": 49, "pct": 6.4, "avg": 44.4}, "20": {"n": 767, "moonshotN": 86, "pct": 11.2, "avg": 51.3}},
+    "創52週新高 ＋ 三大法人近3月買超 ＋ N字底剛形成": {"10": {"n": 688, "moonshotN": 43, "pct": 6.2, "avg": 43.8}, "20": {"n": 688, "moonshotN": 75, "pct": 10.9, "avg": 52.1}},
+    "創52週新高 ＋ 距52週高點≤5% ＋ 突破ABC修正下降切線剛形成": {"10": {"n": 935, "moonshotN": 58, "pct": 6.2, "avg": 46.4}, "20": {"n": 935, "moonshotN": 100, "pct": 10.7, "avg": 52.9}},
+    "爆量(≥1.5倍均量) ＋ 創52週新高 ＋ 近3月乖離度為正(營收優於股價)": {"10": {"n": 4454, "moonshotN": 261, "pct": 5.9, "avg": 45.2}, "20": {"n": 4454, "moonshotN": 451, "pct": 10.1, "avg": 53.1}},
+    "強勢突破盤 ＋ 地量(≤0.5倍均量) ＋ 創52週新高": {"10": {"n": 263, "moonshotN": 31, "pct": 11.8, "avg": 44.0}, "20": {"n": 263, "moonshotN": 58, "pct": 22.1, "avg": 53.8}},
+    "爆量(≥2倍均量) ＋ 距52週高點≤5% ＋ 晨星剛形成": {"10": {"n": 122, "moonshotN": 12, "pct": 9.8, "avg": 42.7}, "20": {"n": 122, "moonshotN": 18, "pct": 14.8, "avg": 53.8}},
+    "DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR) ＋ 晨星剛形成": {"10": {"n": 572, "moonshotN": 36, "pct": 6.3, "avg": 44.1}, "20": {"n": 572, "moonshotN": 73, "pct": 12.8, "avg": 51.9}},
+    "創52週新高 ＋ 近3月乖離度為正(營收優於股價) ＋ 突破飆股大量黑K最高點剛形成": {"10": {"n": 483, "moonshotN": 29, "pct": 6.0, "avg": 43.9}, "20": {"n": 483, "moonshotN": 62, "pct": 12.8, "avg": 53.9}},
+    "回後買上漲全通過 ＋ 創52週新高 ＋ DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR)": {"10": {"n": 2847, "moonshotN": 189, "pct": 6.6, "avg": 43.1}, "20": {"n": 2847, "moonshotN": 343, "pct": 12.0, "avg": 51.1}},
+    "多方力道≥80 ＋ 距52週高點≤5% ＋ 近3日向上跳空缺口": {"10": {"n": 4447, "moonshotN": 258, "pct": 5.8, "avg": 43.3}, "20": {"n": 4447, "moonshotN": 529, "pct": 11.9, "avg": 51.6}},
+    "爆量(≥2倍均量) ＋ 均線多頭排列(5>20>60且站上月線) ＋ 母子懷抱(低檔)剛形成": {"10": {"n": 145, "moonshotN": 9, "pct": 6.2, "avg": 42.9}, "20": {"n": 145, "moonshotN": 16, "pct": 11.0, "avg": 55.7}},
+    "大盤站上20日均線 ＋ 創52週新高 ＋ 突破ABC修正下降切線剛形成": {"10": {"n": 808, "moonshotN": 49, "pct": 6.1, "avg": 45.3}, "20": {"n": 808, "moonshotN": 88, "pct": 10.9, "avg": 51.0}},
+    "量能區間高檔(≥90百分位) ＋ 創52週新高 ＋ 突破ABC修正下降切線剛形成": {"10": {"n": 721, "moonshotN": 43, "pct": 6.0, "avg": 46.9}, "20": {"n": 721, "moonshotN": 78, "pct": 10.8, "avg": 51.3}},
+    "多方力道≥80 ＋ 創52週新高 ＋ 連續放量(近3日均量≥1.5倍前20日均量)": {"10": {"n": 5969, "moonshotN": 346, "pct": 5.8, "avg": 45.0}, "20": {"n": 5969, "moonshotN": 630, "pct": 10.6, "avg": 51.9}},
+    "布林通道高檔(≥80%) ＋ 創52週新高 ＋ 突破ABC修正下降切線剛形成": {"10": {"n": 973, "moonshotN": 58, "pct": 6.0, "avg": 46.4}, "20": {"n": 973, "moonshotN": 103, "pct": 10.6, "avg": 52.3}},
+    "多方力道≥80 ＋ 創52週新高 ＋ 突破飆股大量黑K最高點剛形成": {"10": {"n": 686, "moonshotN": 47, "pct": 6.9, "avg": 45.1}, "20": {"n": 686, "moonshotN": 72, "pct": 10.5, "avg": 53.5}},
+    "多方力道≥80 ＋ KDJ近3日內黃金交叉 ＋ 創52週新高": {"10": {"n": 3795, "moonshotN": 219, "pct": 5.8, "avg": 42.3}, "20": {"n": 3795, "moonshotN": 392, "pct": 10.3, "avg": 51.0}},
+    "距52週高點≤5% ＋ 連續放量(近3日均量≥1.5倍前20日均量) ＋ 突破ABC修正下降切線剛形成": {"10": {"n": 698, "moonshotN": 40, "pct": 5.7, "avg": 46.7}, "20": {"n": 698, "moonshotN": 72, "pct": 10.3, "avg": 52.9}},
+    "大盤站上60日均線 ＋ 創52週新高 ＋ 突破飆股大量黑K最高點剛形成": {"10": {"n": 903, "moonshotN": 56, "pct": 6.2, "avg": 46.3}, "20": {"n": 903, "moonshotN": 107, "pct": 11.8, "avg": 54.1}},
+    "大盤站上60日均線 ＋ 創52週新高 ＋ N字底剛形成": {"10": {"n": 673, "moonshotN": 46, "pct": 6.8, "avg": 44.0}, "20": {"n": 673, "moonshotN": 78, "pct": 11.6, "avg": 51.9}},
+    "大盤站上20日均線 ＋ 回後買上漲全通過 ＋ 創52週新高": {"10": {"n": 3353, "moonshotN": 216, "pct": 6.4, "avg": 43.3}, "20": {"n": 3353, "moonshotN": 384, "pct": 11.5, "avg": 50.1}},
+    "量能斜率轉強(近5日均量>近10日均量20%以上) ＋ DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR) ＋ 突破ABC修正下降切線剛形成": {"10": {"n": 614, "moonshotN": 41, "pct": 6.7, "avg": 44.7}, "20": {"n": 614, "moonshotN": 70, "pct": 11.4, "avg": 52.5}},
+    "布林通道高檔(≥80%) ＋ 創52週新高 ＋ N字底剛形成": {"10": {"n": 774, "moonshotN": 49, "pct": 6.3, "avg": 44.4}, "20": {"n": 774, "moonshotN": 86, "pct": 11.1, "avg": 51.3}},
+    "創52週新高 ＋ 突破飆股大量黑K最高點剛形成 ＋ K線橫盤的突破剛形成": {"10": {"n": 288, "moonshotN": 21, "pct": 7.3, "avg": 46.3}, "20": {"n": 288, "moonshotN": 32, "pct": 11.1, "avg": 52.5}},
+    "創52週新高 ＋ N字底剛形成": {"10": {"n": 779, "moonshotN": 49, "pct": 6.3, "avg": 44.4}, "20": {"n": 779, "moonshotN": 86, "pct": 11.0, "avg": 51.3}},
+    "多方力道≥80 ＋ 回後買上漲全通過 ＋ 距52週高點≤5%": {"10": {"n": 3135, "moonshotN": 199, "pct": 6.3, "avg": 42.5}, "20": {"n": 3135, "moonshotN": 345, "pct": 11.0, "avg": 51.0}},
+    "多方力道≥80 ＋ 大盤站上20日均線 ＋ 創52週新高": {"10": {"n": 8163, "moonshotN": 438, "pct": 5.4, "avg": 44.0}, "20": {"n": 8163, "moonshotN": 887, "pct": 10.9, "avg": 50.5}},
+    "創52週新高 ＋ 突破ABC修正下降切線剛形成": {"10": {"n": 980, "moonshotN": 58, "pct": 5.9, "avg": 46.4}, "20": {"n": 980, "moonshotN": 104, "pct": 10.6, "avg": 52.3}},
+    "多方力道≥80 ＋ 回後買上漲全通過 ＋ 外資近5日買超": {"10": {"n": 3244, "moonshotN": 212, "pct": 6.5, "avg": 42.6}, "20": {"n": 3244, "moonshotN": 345, "pct": 10.6, "avg": 51.7}},
+    "多方力道≥80 ＋ 外資近5日買超 ＋ N字底剛形成": {"10": {"n": 861, "moonshotN": 48, "pct": 5.6, "avg": 43.2}, "20": {"n": 861, "moonshotN": 91, "pct": 10.6, "avg": 49.3}},
+    "大盤站上20日均線 ＋ 回後買上漲全通過 ＋ DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR)": {"10": {"n": 4353, "moonshotN": 248, "pct": 5.7, "avg": 43.4}, "20": {"n": 4353, "moonshotN": 456, "pct": 10.5, "avg": 50.6}},
+    "距52週高點≤5% ＋ DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR) ＋ 突破ABC修正下降切線剛形成": {"10": {"n": 707, "moonshotN": 44, "pct": 6.2, "avg": 46.3}, "20": {"n": 707, "moonshotN": 74, "pct": 10.5, "avg": 54.8}},
+    "爆量(≥2倍均量) ＋ 創52週新高 ＋ 近3月乖離度為正(營收優於股價)": {"10": {"n": 3279, "moonshotN": 213, "pct": 6.5, "avg": 45.8}, "20": {"n": 3279, "moonshotN": 342, "pct": 10.4, "avg": 54.9}},
+    "多方力道≥80 ＋ 量能斜率轉強(近5日均量>近10日均量20%以上) ＋ 創52週新高": {"10": {"n": 4800, "moonshotN": 265, "pct": 5.5, "avg": 44.5}, "20": {"n": 4800, "moonshotN": 489, "pct": 10.2, "avg": 51.7}},
+    "多方力道≥80 ＋ 量能區間高檔(≥90百分位) ＋ 回後買上漲全通過": {"10": {"n": 3439, "moonshotN": 212, "pct": 6.2, "avg": 43.1}, "20": {"n": 3439, "moonshotN": 347, "pct": 10.1, "avg": 50.9}},
+    "量能區間高檔(≥90百分位) ＋ 量能斜率轉弱(近5日均量<近10日均量20%以上) ＋ 距52週高點≤5%": {"10": {"n": 1198, "moonshotN": 51, "pct": 4.3, "avg": 43.8}, "20": {"n": 1198, "moonshotN": 121, "pct": 10.1, "avg": 48.5}},
+    "量能斜率轉弱(近5日均量<近10日均量20%以上) ＋ 創52週新高 ＋ 近3月均價YoY為負": {"10": {"n": 275, "moonshotN": 16, "pct": 5.8, "avg": 44.4}, "20": {"n": 275, "moonshotN": 45, "pct": 16.4, "avg": 43.2}},
+    "地量(≤0.5倍均量) ＋ 創52週新高 ＋ 三大法人近3月買超": {"10": {"n": 558, "moonshotN": 41, "pct": 7.3, "avg": 42.8}, "20": {"n": 558, "moonshotN": 86, "pct": 15.4, "avg": 53.9}},
+    "強勢突破盤 ＋ 距52週高點≤5% ＋ 晨星剛形成": {"10": {"n": 206, "moonshotN": 13, "pct": 6.3, "avg": 47.5}, "20": {"n": 206, "moonshotN": 27, "pct": 13.1, "avg": 50.7}},
+    "創52週新高 ＋ 均線多頭排列(5>20>60且站上月線) ＋ 近3日向上跳空缺口": {"10": {"n": 5727, "moonshotN": 378, "pct": 6.6, "avg": 45.4}, "20": {"n": 5727, "moonshotN": 721, "pct": 12.6, "avg": 52.8}},
+    "量能區間高檔(≥90百分位) ＋ 距52週高點≤5% ＋ 晨星剛形成": {"10": {"n": 274, "moonshotN": 19, "pct": 6.9, "avg": 47.0}, "20": {"n": 274, "moonshotN": 34, "pct": 12.4, "avg": 51.0}},
+    "多方力道≥65 ＋ 回後買上漲全通過 ＋ 創52週新高": {"10": {"n": 3435, "moonshotN": 230, "pct": 6.7, "avg": 43.2}, "20": {"n": 3435, "moonshotN": 393, "pct": 11.4, "avg": 51.3}},
+    "多方力道≥65 ＋ 創52週新高 ＋ 突破ABC修正下降切線剛形成": {"10": {"n": 718, "moonshotN": 48, "pct": 6.7, "avg": 47.5}, "20": {"n": 718, "moonshotN": 82, "pct": 11.4, "avg": 54.0}},
+    "相對強弱為正(強於大盤) ＋ 創52週新高 ＋ 突破飆股大量黑K最高點剛形成": {"10": {"n": 988, "moonshotN": 61, "pct": 6.2, "avg": 46.1}, "20": {"n": 988, "moonshotN": 113, "pct": 11.4, "avg": 54.2}},
+    "創52週新高 ＋ 距52週高點≤5% ＋ 突破飆股大量黑K最高點剛形成": {"10": {"n": 999, "moonshotN": 61, "pct": 6.1, "avg": 46.2}, "20": {"n": 999, "moonshotN": 114, "pct": 11.4, "avg": 53.9}},
+    "多方力道≥65 ＋ 距52週高點≤5% ＋ 近3日向上跳空缺口": {"10": {"n": 6242, "moonshotN": 361, "pct": 5.8, "avg": 44.0}, "20": {"n": 6242, "moonshotN": 699, "pct": 11.2, "avg": 52.2}},
+    "大盤站上20日均線 ＋ 距52週高點≤5% ＋ 突破飆股大量黑K最高點剛形成": {"10": {"n": 1114, "moonshotN": 62, "pct": 5.6, "avg": 47.1}, "20": {"n": 1114, "moonshotN": 122, "pct": 11.0, "avg": 54.1}},
+    "創52週新高 ＋ 連續放量(近3日均量≥1.5倍前20日均量) ＋ DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR)": {"10": {"n": 6361, "moonshotN": 368, "pct": 5.8, "avg": 45.6}, "20": {"n": 6361, "moonshotN": 685, "pct": 10.8, "avg": 52.0}},
+    "距52週高點≤5% ＋ DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR) ＋ N字底剛形成": {"10": {"n": 833, "moonshotN": 51, "pct": 6.1, "avg": 44.1}, "20": {"n": 833, "moonshotN": 89, "pct": 10.7, "avg": 49.7}},
+    "量能斜率轉強(近5日均量>近10日均量20%以上) ＋ 創52週新高 ＋ DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR)": {"10": {"n": 5100, "moonshotN": 283, "pct": 5.5, "avg": 44.8}, "20": {"n": 5100, "moonshotN": 539, "pct": 10.6, "avg": 51.8}},
+    "多方力道≥80 ＋ 量能區間高檔(≥90百分位) ＋ 創52週新高": {"10": {"n": 7326, "moonshotN": 403, "pct": 5.5, "avg": 44.0}, "20": {"n": 7326, "moonshotN": 749, "pct": 10.2, "avg": 51.0}},
+    "量能區間低檔(≤10百分位) ＋ 距52週高點≤5% ＋ 近3日向上跳空缺口": {"10": {"n": 61, "moonshotN": 3, "pct": 4.9, "avg": 37.0}, "20": {"n": 61, "moonshotN": 10, "pct": 16.4, "avg": 49.8}},
+    "KDJ近3日內黃金交叉 ＋ 地量(≤0.5倍均量) ＋ 創52週新高": {"10": {"n": 255, "moonshotN": 19, "pct": 7.5, "avg": 42.1}, "20": {"n": 255, "moonshotN": 41, "pct": 16.1, "avg": 56.8}},
+    "均線多頭排列(5>20>60且站上月線) ＋ 突破飆股大量黑K最高點剛形成 ＋ 母子懷抱(低檔)剛形成": {"10": {"n": 85, "moonshotN": 6, "pct": 7.1, "avg": 38.9}, "20": {"n": 85, "moonshotN": 13, "pct": 15.3, "avg": 50.4}},
+    "連續放量(近3日均量≥1.5倍前20日均量) ＋ 突破飆股大量黑K最高點剛形成 ＋ 母子懷抱(低檔)剛形成": {"10": {"n": 91, "moonshotN": 6, "pct": 6.6, "avg": 38.9}, "20": {"n": 91, "moonshotN": 13, "pct": 14.3, "avg": 50.1}},
+    "均線多頭排列(5>20>60且站上月線) ＋ 近3月均價YoY為正 ＋ 晨星剛形成": {"10": {"n": 561, "moonshotN": 45, "pct": 8.0, "avg": 44.5}, "20": {"n": 561, "moonshotN": 75, "pct": 13.4, "avg": 53.5}},
+    "多方力道≥65 ＋ 均線多頭排列(5>20>60且站上月線) ＋ 晨星剛形成": {"10": {"n": 636, "moonshotN": 44, "pct": 6.9, "avg": 43.0}, "20": {"n": 636, "moonshotN": 82, "pct": 12.9, "avg": 51.4}},
+    "創52週新高 ＋ 距52週高點≤5% ＋ 近3日向上跳空缺口": {"10": {"n": 4994, "moonshotN": 320, "pct": 6.4, "avg": 44.6}, "20": {"n": 4994, "moonshotN": 604, "pct": 12.1, "avg": 52.6}},
+    "地量(≤0.5倍均量) ＋ DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR) ＋ N字底剛形成": {"10": {"n": 134, "moonshotN": 11, "pct": 8.2, "avg": 38.9}, "20": {"n": 134, "moonshotN": 16, "pct": 11.9, "avg": 61.6}},
+    "距52週高點≤5% ＋ 近3月乖離度為正(營收優於股價) ＋ 晨星剛形成": {"10": {"n": 169, "moonshotN": 11, "pct": 6.5, "avg": 45.8}, "20": {"n": 169, "moonshotN": 20, "pct": 11.8, "avg": 51.5}},
+    "距52週高點≤5% ＋ 母子懷抱(低檔)剛形成 ＋ 晨星剛形成": {"10": {"n": 128, "moonshotN": 11, "pct": 8.6, "avg": 46.6}, "20": {"n": 128, "moonshotN": 15, "pct": 11.7, "avg": 46.5}},
+    "距52週高點≤5% ＋ 近3日向上跳空缺口 ＋ DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR)": {"10": {"n": 4856, "moonshotN": 277, "pct": 5.7, "avg": 43.5}, "20": {"n": 4856, "moonshotN": 565, "pct": 11.6, "avg": 51.8}},
+    "強勢突破盤 ＋ 創52週新高 ＋ 突破飆股大量黑K最高點剛形成": {"10": {"n": 864, "moonshotN": 49, "pct": 5.7, "avg": 46.1}, "20": {"n": 864, "moonshotN": 98, "pct": 11.3, "avg": 52.2}},
+    "回後買上漲全通過 ＋ 距52週高點≤5% ＋ DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR)": {"10": {"n": 3413, "moonshotN": 216, "pct": 6.3, "avg": 43.3}, "20": {"n": 3413, "moonshotN": 382, "pct": 11.2, "avg": 51.2}},
+    "爆量(≥1.5倍均量) ＋ 創52週新高 ＋ 突破ABC修正下降切線剛形成": {"10": {"n": 678, "moonshotN": 42, "pct": 6.2, "avg": 45.3}, "20": {"n": 678, "moonshotN": 75, "pct": 11.1, "avg": 52.8}},
+    "創52週新高 ＋ 距52週高點≤5% ＋ N字底剛形成": {"10": {"n": 766, "moonshotN": 48, "pct": 6.3, "avg": 44.3}, "20": {"n": 766, "moonshotN": 84, "pct": 11.0, "avg": 51.1}},
+    "多方力道≥80 ＋ 強勢突破盤 ＋ 創52週新高": {"10": {"n": 5991, "moonshotN": 340, "pct": 5.7, "avg": 43.9}, "20": {"n": 5991, "moonshotN": 645, "pct": 10.8, "avg": 51.0}},
+    "回後買上漲全通過 ＋ DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR) ＋ N字底剛形成": {"10": {"n": 808, "moonshotN": 53, "pct": 6.6, "avg": 44.1}, "20": {"n": 808, "moonshotN": 87, "pct": 10.8, "avg": 50.0}},
+    "多方力道≥80 ＋ 相對強弱為正(強於大盤) ＋ 創52週新高": {"10": {"n": 9435, "moonshotN": 510, "pct": 5.4, "avg": 43.7}, "20": {"n": 9435, "moonshotN": 1001, "pct": 10.6, "avg": 50.7}},
+    "大盤站上20日均線 ＋ 創52週新高 ＋ 連續放量(近3日均量≥1.5倍前20日均量)": {"10": {"n": 7413, "moonshotN": 421, "pct": 5.7, "avg": 46.7}, "20": {"n": 7413, "moonshotN": 783, "pct": 10.6, "avg": 52.8}},
+    "量能斜率轉弱(近5日均量<近10日均量20%以上) ＋ 距52週高點≤5% ＋ N字底剛形成": {"10": {"n": 239, "moonshotN": 14, "pct": 5.9, "avg": 42.4}, "20": {"n": 239, "moonshotN": 25, "pct": 10.5, "avg": 51.1}},
+    "多方力道≥80 ＋ 創52週新高 ＋ 外資近5日買超": {"10": {"n": 6966, "moonshotN": 361, "pct": 5.2, "avg": 44.3}, "20": {"n": 6966, "moonshotN": 726, "pct": 10.4, "avg": 50.7}},
+    "量能區間高檔(≥90百分位) ＋ 創52週新高 ＋ DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR)": {"10": {"n": 7780, "moonshotN": 434, "pct": 5.6, "avg": 44.6}, "20": {"n": 7780, "moonshotN": 812, "pct": 10.4, "avg": 51.4}},
+    "多方力道≥80 ＋ 爆量(≥1.5倍均量) ＋ 創52週新高": {"10": {"n": 5983, "moonshotN": 342, "pct": 5.7, "avg": 44.2}, "20": {"n": 5983, "moonshotN": 607, "pct": 10.1, "avg": 51.8}},
+    "量能斜率轉弱(近5日均量<近10日均量20%以上) ＋ 大盤站上20日均線 ＋ 創52週新高": {"10": {"n": 1001, "moonshotN": 61, "pct": 6.1, "avg": 41.6}, "20": {"n": 1001, "moonshotN": 127, "pct": 12.7, "avg": 50.0}},
+    "布林通道高檔(≥80%) ＋ 創52週新高 ＋ 近3日向上跳空缺口": {"10": {"n": 5906, "moonshotN": 379, "pct": 6.4, "avg": 45.4}, "20": {"n": 5906, "moonshotN": 724, "pct": 12.3, "avg": 52.5}},
+    "創52週新高 ＋ 突破飆股大量黑K最高點剛形成": {"10": {"n": 1027, "moonshotN": 62, "pct": 6.0, "avg": 45.9}, "20": {"n": 1027, "moonshotN": 115, "pct": 11.2, "avg": 53.8}},
+    "回後買上漲全通過 ＋ 創52週新高 ＋ 突破飆股大量黑K最高點剛形成": {"10": {"n": 553, "moonshotN": 37, "pct": 6.7, "avg": 46.1}, "20": {"n": 553, "moonshotN": 62, "pct": 11.2, "avg": 54.0}},
+    "創52週新高 ＋ 連續放量(近3日均量≥1.5倍前20日均量) ＋ 突破飆股大量黑K最高點剛形成": {"10": {"n": 950, "moonshotN": 56, "pct": 5.9, "avg": 46.6}, "20": {"n": 950, "moonshotN": 106, "pct": 11.2, "avg": 53.7}},
+    "多方力道≥80 ＋ 量能斜率轉弱(近5日均量<近10日均量20%以上) ＋ N字底剛形成": {"10": {"n": 338, "moonshotN": 22, "pct": 6.5, "avg": 42.5}, "20": {"n": 338, "moonshotN": 37, "pct": 10.9, "avg": 50.4}},
+    "大盤站上20日均線 ＋ 創52週新高 ＋ DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR)": {"10": {"n": 8786, "moonshotN": 470, "pct": 5.3, "avg": 44.3}, "20": {"n": 8786, "moonshotN": 959, "pct": 10.9, "avg": 50.8}},
+    "KDJ近3日內黃金交叉 ＋ 回後買上漲全通過 ＋ 創52週新高": {"10": {"n": 2102, "moonshotN": 138, "pct": 6.6, "avg": 42.7}, "20": {"n": 2102, "moonshotN": 228, "pct": 10.8, "avg": 51.1}},
+    "多方力道≥65 ＋ 創52週新高 ＋ 連續放量(近3日均量≥1.5倍前20日均量)": {"10": {"n": 7887, "moonshotN": 462, "pct": 5.9, "avg": 46.1}, "20": {"n": 7887, "moonshotN": 838, "pct": 10.6, "avg": 52.8}},
+    "爆量(≥1.5倍均量) ＋ 創52週新高 ＋ 突破飆股大量黑K最高點剛形成": {"10": {"n": 943, "moonshotN": 54, "pct": 5.7, "avg": 44.4}, "20": {"n": 943, "moonshotN": 100, "pct": 10.6, "avg": 51.8}},
+    "多方力道≥65 ＋ 地量(≤0.5倍均量) ＋ 量能區間高檔(≥90百分位)": {"10": {"n": 1265, "moonshotN": 54, "pct": 4.3, "avg": 45.0}, "20": {"n": 1265, "moonshotN": 131, "pct": 10.4, "avg": 48.4}},
+    "爆量(≥2倍均量) ＋ 大盤站上20日均線 ＋ 創52週新高": {"10": {"n": 5518, "moonshotN": 311, "pct": 5.6, "avg": 46.4}, "20": {"n": 5518, "moonshotN": 569, "pct": 10.3, "avg": 53.9}},
+    "量能區間高檔(≥90百分位) ＋ 大盤站上20日均線 ＋ 創52週新高": {"10": {"n": 8955, "moonshotN": 485, "pct": 5.4, "avg": 45.4}, "20": {"n": 8955, "moonshotN": 914, "pct": 10.2, "avg": 52.1}},
+    "多方力道≥65 ＋ 近3日向上跳空缺口 ＋ 突破ABC修正下降切線剛形成": {"10": {"n": 624, "moonshotN": 41, "pct": 6.6, "avg": 43.4}, "20": {"n": 624, "moonshotN": 63, "pct": 10.1, "avg": 50.9}},
+    "多方力道≥80 ＋ 布林通道高檔(≥80%) ＋ 回後買上漲全通過": {"10": {"n": 4403, "moonshotN": 253, "pct": 5.7, "avg": 42.7}, "20": {"n": 4403, "moonshotN": 447, "pct": 10.2, "avg": 51.2}},
+    "多方力道≥80 ＋ 布林通道高檔(≥80%) ＋ N字底剛形成": {"10": {"n": 1036, "moonshotN": 56, "pct": 5.4, "avg": 43.2}, "20": {"n": 1036, "moonshotN": 105, "pct": 10.1, "avg": 48.0}},
+    "均線多頭排列(5>20>60且站上月線) ＋ 近3月乖離度為負(股價超前營收) ＋ 晨星剛形成": {"10": {"n": 456, "moonshotN": 34, "pct": 7.5, "avg": 45.0}, "20": {"n": 456, "moonshotN": 63, "pct": 13.8, "avg": 53.1}},
+    "大盤站上20日均線 ＋ 均線多頭排列(5>20>60且站上月線) ＋ 晨星剛形成": {"10": {"n": 705, "moonshotN": 51, "pct": 7.2, "avg": 42.9}, "20": {"n": 705, "moonshotN": 96, "pct": 13.6, "avg": 51.9}},
+    "多方力道≥80 ＋ 地量(≤0.5倍均量) ＋ 連續放量(近3日均量≥1.5倍前20日均量)": {"10": {"n": 255, "moonshotN": 18, "pct": 7.1, "avg": 40.2}, "20": {"n": 255, "moonshotN": 35, "pct": 13.7, "avg": 59.8}},
+    "創52週新高 ＋ 近3月均價YoY為負 ＋ 突破ABC修正下降切線剛形成": {"10": {"n": 203, "moonshotN": 13, "pct": 6.4, "avg": 45.7}, "20": {"n": 203, "moonshotN": 27, "pct": 13.3, "avg": 53.5}},
+    "多方力道≥80 ＋ 外資近5日買超 ＋ 晨星剛形成": {"10": {"n": 257, "moonshotN": 25, "pct": 9.7, "avg": 44.7}, "20": {"n": 257, "moonshotN": 34, "pct": 13.2, "avg": 51.4}},
+    "創52週新高 ＋ 近3日向上跳空缺口": {"10": {"n": 6016, "moonshotN": 386, "pct": 6.4, "avg": 45.5}, "20": {"n": 6016, "moonshotN": 739, "pct": 12.3, "avg": 52.8}},
+    "創52週新高 ＋ 近3日向上跳空缺口 ＋ 外資近5日買超": {"10": {"n": 4559, "moonshotN": 283, "pct": 6.2, "avg": 45.9}, "20": {"n": 4559, "moonshotN": 551, "pct": 12.1, "avg": 52.5}},
+    "回後買上漲全通過 ＋ 創52週新高 ＋ N字底剛形成": {"10": {"n": 559, "moonshotN": 38, "pct": 6.8, "avg": 45.1}, "20": {"n": 559, "moonshotN": 65, "pct": 11.6, "avg": 52.3}},
+    "創52週新高 ＋ DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR) ＋ 突破飆股大量黑K最高點剛形成": {"10": {"n": 741, "moonshotN": 51, "pct": 6.9, "avg": 45.6}, "20": {"n": 741, "moonshotN": 82, "pct": 11.1, "avg": 53.7}},
+    "創52週新高 ＋ 三大法人近3月買超 ＋ 突破ABC修正下降切線剛形成": {"10": {"n": 825, "moonshotN": 53, "pct": 6.4, "avg": 46.7}, "20": {"n": 825, "moonshotN": 91, "pct": 11.0, "avg": 53.0}},
+    "強勢突破盤 ＋ 創52週新高 ＋ DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR)": {"10": {"n": 6381, "moonshotN": 363, "pct": 5.7, "avg": 44.5}, "20": {"n": 6381, "moonshotN": 695, "pct": 10.9, "avg": 51.1}},
+    "相對強弱為正(強於大盤) ＋ 創52週新高 ＋ DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR)": {"10": {"n": 10094, "moonshotN": 549, "pct": 5.4, "avg": 44.3}, "20": {"n": 10094, "moonshotN": 1095, "pct": 10.8, "avg": 51.0}},
+    "量能區間高檔(≥90百分位) ＋ 回後買上漲全通過 ＋ 創52週新高": {"10": {"n": 3088, "moonshotN": 200, "pct": 6.5, "avg": 43.6}, "20": {"n": 3088, "moonshotN": 330, "pct": 10.7, "avg": 50.6}},
+    "回後買上漲全通過 ＋ 三大法人近3月買超 ＋ DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR)": {"10": {"n": 3855, "moonshotN": 234, "pct": 6.1, "avg": 43.7}, "20": {"n": 3855, "moonshotN": 414, "pct": 10.7, "avg": 51.7}},
+    "多方力道≥80 ＋ 布林通道高檔(≥80%) ＋ 創52週新高": {"10": {"n": 9447, "moonshotN": 502, "pct": 5.3, "avg": 43.6}, "20": {"n": 9447, "moonshotN": 985, "pct": 10.4, "avg": 50.4}},
+    "多方力道≥80 ＋ 創52週新高 ＋ DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR)": {"10": {"n": 9835, "moonshotN": 516, "pct": 5.2, "avg": 43.8}, "20": {"n": 9835, "moonshotN": 1020, "pct": 10.4, "avg": 50.6}},
+    "多方力道≥80 ＋ 近3月均價YoY為正 ＋ N字底剛形成": {"10": {"n": 759, "moonshotN": 44, "pct": 5.8, "avg": 41.1}, "20": {"n": 759, "moonshotN": 79, "pct": 10.4, "avg": 47.8}},
+    "爆量(≥1.5倍均量) ＋ 創52週新高 ＋ DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR)": {"10": {"n": 6419, "moonshotN": 369, "pct": 5.7, "avg": 44.9}, "20": {"n": 6419, "moonshotN": 668, "pct": 10.4, "avg": 52.0}},
+    "近3月乖離度為正(營收優於股價) ＋ 三重底剛形成 ＋ 突破飆股大量黑K最高點剛形成": {"10": {"n": 193, "moonshotN": 7, "pct": 3.6, "avg": 43.8}, "20": {"n": 193, "moonshotN": 20, "pct": 10.4, "avg": 54.9}},
+    "多方力道≥80 ＋ 創52週新高": {"10": {"n": 9883, "moonshotN": 518, "pct": 5.2, "avg": 43.7}, "20": {"n": 9883, "moonshotN": 1021, "pct": 10.3, "avg": 50.6}},
+    "多方力道≥80 ＋ 爆量(≥2倍均量) ＋ 創52週新高": {"10": {"n": 4305, "moonshotN": 251, "pct": 5.8, "avg": 45.1}, "20": {"n": 4305, "moonshotN": 442, "pct": 10.3, "avg": 53.6}},
+    "多方力道≥80 ＋ 回後買上漲全通過 ＋ 均線多頭排列(5>20>60且站上月線)": {"10": {"n": 4204, "moonshotN": 245, "pct": 5.8, "avg": 43.0}, "20": {"n": 4204, "moonshotN": 433, "pct": 10.3, "avg": 51.3}},
+    "KDJ近3日內黃金交叉 ＋ 創52週新高 ＋ DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR)": {"10": {"n": 4175, "moonshotN": 235, "pct": 5.6, "avg": 42.9}, "20": {"n": 4175, "moonshotN": 432, "pct": 10.3, "avg": 51.1}},
+    "多方力道≥80 ＋ 大盤站上20日均線 ＋ 近3日向上跳空缺口": {"10": {"n": 7497, "moonshotN": 380, "pct": 5.1, "avg": 43.6}, "20": {"n": 7497, "moonshotN": 765, "pct": 10.2, "avg": 51.4}},
+    "多方力道≥80 ＋ 回後買上漲全通過 ＋ DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR)": {"10": {"n": 4422, "moonshotN": 254, "pct": 5.7, "avg": 42.9}, "20": {"n": 4422, "moonshotN": 450, "pct": 10.2, "avg": 51.2}},
+    "量能斜率轉強(近5日均量>近10日均量20%以上) ＋ 大盤站上20日均線 ＋ 創52週新高": {"10": {"n": 6381, "moonshotN": 340, "pct": 5.3, "avg": 45.9}, "20": {"n": 6381, "moonshotN": 649, "pct": 10.2, "avg": 53.1}},
+    "多方力道≥80 ＋ 回後買上漲全通過": {"10": {"n": 4456, "moonshotN": 256, "pct": 5.7, "avg": 42.9}, "20": {"n": 4456, "moonshotN": 451, "pct": 10.1, "avg": 51.2}},
+    "量能區間高檔(≥90百分位) ＋ 大盤站上20日均線 ＋ 母子懷抱(低檔)剛形成": {"10": {"n": 457, "moonshotN": 30, "pct": 6.6, "avg": 48.3}, "20": {"n": 457, "moonshotN": 46, "pct": 10.1, "avg": 54.0}},
+    "布林通道高檔(≥80%) ＋ 地量(≤0.5倍均量) ＋ 近3日向上跳空缺口": {"10": {"n": 798, "moonshotN": 68, "pct": 8.5, "avg": 45.5}, "20": {"n": 798, "moonshotN": 122, "pct": 15.3, "avg": 55.6}},
+    "強勢突破盤 ＋ 創52週新高 ＋ 近3日向上跳空缺口": {"10": {"n": 4207, "moonshotN": 278, "pct": 6.6, "avg": 45.6}, "20": {"n": 4207, "moonshotN": 510, "pct": 12.1, "avg": 52.9}},
+    "相對強弱為正(強於大盤) ＋ 回後買上漲全通過 ＋ 創52週新高": {"10": {"n": 3806, "moonshotN": 245, "pct": 6.4, "avg": 43.2}, "20": {"n": 3806, "moonshotN": 426, "pct": 11.2, "avg": 51.1}},
+    "創52週新高 ＋ 均線多頭排列(5>20>60且站上月線) ＋ 突破飆股大量黑K最高點剛形成": {"10": {"n": 987, "moonshotN": 57, "pct": 5.8, "avg": 46.1}, "20": {"n": 987, "moonshotN": 108, "pct": 10.9, "avg": 54.6}},
+    "多方力道≥80 ＋ 近3日向上跳空缺口 ＋ 突破ABC修正下降切線剛形成": {"10": {"n": 303, "moonshotN": 23, "pct": 7.6, "avg": 42.7}, "20": {"n": 303, "moonshotN": 32, "pct": 10.6, "avg": 53.9}},
+    "相對強弱為正(強於大盤) ＋ 大盤站上20日均線 ＋ 創52週新高": {"10": {"n": 11391, "moonshotN": 615, "pct": 5.4, "avg": 44.8}, "20": {"n": 11391, "moonshotN": 1209, "pct": 10.6, "avg": 51.3}},
+    "創52週新高 ＋ 外資近5日買超 ＋ DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR)": {"10": {"n": 7562, "moonshotN": 394, "pct": 5.2, "avg": 44.8}, "20": {"n": 7562, "moonshotN": 799, "pct": 10.6, "avg": 51.1}},
+    "多方力道≥65 ＋ 大盤站上20日均線 ＋ 創52週新高": {"10": {"n": 10777, "moonshotN": 580, "pct": 5.4, "avg": 44.7}, "20": {"n": 10777, "moonshotN": 1135, "pct": 10.5, "avg": 51.4}},
+    "多方力道≥65 ＋ 量能區間高檔(≥90百分位) ＋ 創52週新高": {"10": {"n": 9523, "moonshotN": 530, "pct": 5.6, "avg": 44.9}, "20": {"n": 9523, "moonshotN": 972, "pct": 10.2, "avg": 52.0}},
+    "多方力道≥80 ＋ 大盤站上60日均線 ＋ N字底剛形成": {"10": {"n": 1036, "moonshotN": 58, "pct": 5.6, "avg": 42.8}, "20": {"n": 1036, "moonshotN": 106, "pct": 10.2, "avg": 48.3}},
+    "多方力道≥80 ＋ 創52週新高 ＋ 均線多頭排列(5>20>60且站上月線)": {"10": {"n": 9727, "moonshotN": 508, "pct": 5.2, "avg": 43.6}, "20": {"n": 9727, "moonshotN": 996, "pct": 10.2, "avg": 50.7}},
+    "爆量(≥1.5倍均量) ＋ 大盤站上20日均線 ＋ 創52週新高": {"10": {"n": 7741, "moonshotN": 421, "pct": 5.4, "avg": 45.8}, "20": {"n": 7741, "moonshotN": 787, "pct": 10.2, "avg": 52.6}},
+    "量能區間高檔(≥90百分位) ＋ DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR) ＋ N字底剛形成": {"10": {"n": 872, "moonshotN": 56, "pct": 6.4, "avg": 43.1}, "20": {"n": 872, "moonshotN": 89, "pct": 10.2, "avg": 49.5}},
+    "強勢突破盤 ＋ 創52週新高 ＋ 連續放量(近3日均量≥1.5倍前20日均量)": {"10": {"n": 6676, "moonshotN": 359, "pct": 5.4, "avg": 46.3}, "20": {"n": 6676, "moonshotN": 676, "pct": 10.1, "avg": 52.6}},
+    "爆量(≥2倍均量) ＋ 量能斜率轉強(近5日均量>近10日均量20%以上) ＋ 創52週新高": {"10": {"n": 5405, "moonshotN": 294, "pct": 5.4, "avg": 46.0}, "20": {"n": 5405, "moonshotN": 547, "pct": 10.1, "avg": 53.8}},
+    "地量(≤0.5倍均量) ＋ 量能區間高檔(≥90百分位) ＋ DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR)": {"10": {"n": 1193, "moonshotN": 51, "pct": 4.3, "avg": 44.6}, "20": {"n": 1193, "moonshotN": 122, "pct": 10.2, "avg": 47.8}},
+    "量能斜率轉弱(近5日均量<近10日均量20%以上) ＋ 回後買上漲全通過 ＋ 創52週新高": {"10": {"n": 368, "moonshotN": 27, "pct": 7.3, "avg": 42.1}, "20": {"n": 368, "moonshotN": 52, "pct": 14.1, "avg": 54.9}},
+    "相對強弱為正(強於大盤) ＋ 創52週新高 ＋ 近3日向上跳空缺口": {"10": {"n": 5696, "moonshotN": 376, "pct": 6.6, "avg": 45.4}, "20": {"n": 5696, "moonshotN": 720, "pct": 12.6, "avg": 52.9}},
+    "大盤站上20日均線 ＋ 外資近5日買超 ＋ 晨星剛形成": {"10": {"n": 684, "moonshotN": 44, "pct": 6.4, "avg": 44.9}, "20": {"n": 684, "moonshotN": 78, "pct": 11.4, "avg": 50.8}},
+    "距52週高點≤5% ＋ 突破ABC修正下降切線剛形成 ＋ 突破飆股大量黑K最高點剛形成": {"10": {"n": 272, "moonshotN": 16, "pct": 5.9, "avg": 45.5}, "20": {"n": 272, "moonshotN": 30, "pct": 11.0, "avg": 51.0}},
+    "量能斜率轉強(近5日均量>近10日均量20%以上) ＋ 創52週新高 ＋ 突破飆股大量黑K最高點剛形成": {"10": {"n": 800, "moonshotN": 44, "pct": 5.5, "avg": 45.1}, "20": {"n": 800, "moonshotN": 87, "pct": 10.9, "avg": 52.8}},
+    "回後買上漲全通過 ＋ 創52週新高 ＋ 距52週高點≤5%": {"10": {"n": 4001, "moonshotN": 248, "pct": 6.2, "avg": 43.4}, "20": {"n": 4001, "moonshotN": 437, "pct": 10.9, "avg": 50.9}},
+    "回後買上漲全通過 ＋ 創52週新高 ＋ 連續放量(近3日均量≥1.5倍前20日均量)": {"10": {"n": 2349, "moonshotN": 156, "pct": 6.6, "avg": 44.6}, "20": {"n": 2349, "moonshotN": 257, "pct": 10.9, "avg": 51.8}},
+    "相對強弱為正(強於大盤) ＋ 距52週高點≤5% ＋ 突破飆股大量黑K最高點剛形成": {"10": {"n": 1295, "moonshotN": 72, "pct": 5.6, "avg": 46.7}, "20": {"n": 1295, "moonshotN": 138, "pct": 10.7, "avg": 54.5}},
+    "布林通道高檔(≥80%) ＋ 創52週新高 ＋ DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR)": {"10": {"n": 10161, "moonshotN": 540, "pct": 5.3, "avg": 44.1}, "20": {"n": 10161, "moonshotN": 1078, "pct": 10.6, "avg": 50.6}},
+    "KDJ近3日內黃金交叉 ＋ 創52週新高 ＋ 突破飆股大量黑K最高點剛形成": {"10": {"n": 367, "moonshotN": 21, "pct": 5.7, "avg": 44.0}, "20": {"n": 367, "moonshotN": 39, "pct": 10.6, "avg": 60.0}},
+    "爆量(≥2倍均量) ＋ 創52週新高 ＋ DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR)": {"10": {"n": 4587, "moonshotN": 270, "pct": 5.9, "avg": 45.5}, "20": {"n": 4587, "moonshotN": 487, "pct": 10.6, "avg": 53.5}},
+    "多方力道≥65 ＋ 爆量(≥2倍均量) ＋ 創52週新高": {"10": {"n": 5809, "moonshotN": 338, "pct": 5.8, "avg": 45.9}, "20": {"n": 5809, "moonshotN": 601, "pct": 10.3, "avg": 54.1}},
+    "多方力道≥65 ＋ 量能斜率轉強(近5日均量>近10日均量20%以上) ＋ 創52週新高": {"10": {"n": 6565, "moonshotN": 369, "pct": 5.6, "avg": 45.5}, "20": {"n": 6565, "moonshotN": 675, "pct": 10.3, "avg": 53.3}},
+    "多方力道≥80 ＋ 創52週新高 ＋ 三大法人近3月買超": {"10": {"n": 8242, "moonshotN": 423, "pct": 5.1, "avg": 43.8}, "20": {"n": 8242, "moonshotN": 852, "pct": 10.3, "avg": 50.4}},
+    "多方力道≥65 ＋ KDJ近3日內黃金交叉 ＋ 創52週新高": {"10": {"n": 4994, "moonshotN": 284, "pct": 5.7, "avg": 43.3}, "20": {"n": 4994, "moonshotN": 508, "pct": 10.2, "avg": 51.1}},
+    "多方力道≥65 ＋ 爆量(≥1.5倍均量) ＋ 創52週新高": {"10": {"n": 8081, "moonshotN": 460, "pct": 5.7, "avg": 45.3}, "20": {"n": 8081, "moonshotN": 824, "pct": 10.2, "avg": 52.7}},
+    "多方力道≥80 ＋ 創52週新高 ＋ 距52週高點≤5%": {"10": {"n": 8146, "moonshotN": 417, "pct": 5.1, "avg": 42.9}, "20": {"n": 8146, "moonshotN": 828, "pct": 10.2, "avg": 50.0}},
+    "回後買上漲全通過 ＋ 外資近5日買超 ＋ DMI趨勢增強(+DI>-DI、ADX≥25且>ADXR)": {"10": {"n": 3851, "moonshotN": 231, "pct": 6.0, "avg": 43.2}, "20": {"n": 3851, "moonshotN": 391, "pct": 10.2, "avg": 51.7}},
+    "強勢突破盤 ＋ 地量(≤0.5倍均量) ＋ 近3日向上跳空缺口": {"10": {"n": 277, "moonshotN": 36, "pct": 13.0, "avg": 46.0}, "20": {"n": 277, "moonshotN": 58, "pct": 20.9, "avg": 57.2}},
+
 }
 BT_HIT_SHOW = 3   # 摘要表每類最多顯示幾個編號，其餘以「+N」表示
 
