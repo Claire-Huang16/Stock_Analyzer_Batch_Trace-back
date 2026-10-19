@@ -1999,6 +1999,22 @@ def fetch_realtime(token, ids, chunk=80):
     return mp, (None if mp else err)
 
 
+# ── 盤中即時量換算成全天估計量（2026-10-19）：盤中的累積成交量只是「到目前為止」的量，直接拿來跟均量比，
+#    幾乎每檔都會被誤判成「地量」。依開盤後經過的時間推估全天量；成交量前段較多，累積比例 ≈ 時間比例^0.8；
+#    開盤15分鐘內以15分鐘計（避免放大太多），收盤後（或開盤前）不換算。
+def intraday_volume_factor(ts_utc, tz, open_min, close_min):
+    try:
+        from zoneinfo import ZoneInfo
+        loc = ts_utc.astimezone(ZoneInfo(tz))
+        t = loc.hour * 60 + loc.minute
+        if t >= close_min or t <= open_min:
+            return 1.0
+        frac = max((t - open_min) / (close_min - open_min), 15 / (close_min - open_min))
+        return 1.0 / frac ** 0.8
+    except Exception:  # noqa
+        return 1.0
+
+
 def merge_realtime(rows, snap):
     if not snap or not snap.get('date'):
         return rows, False
@@ -2023,6 +2039,15 @@ def merge_realtime(rows, snap):
         vol = float(vol)
     except Exception:  # noqa
         vol = 0
+    # 盤中累積量 → 全天估計量（台股 09:00～13:30）；快照有時間就用快照時間，否則用現在時間
+    try:
+        ds = str(snap['date'])
+        ts = (dt.datetime.fromisoformat(ds[:19].replace(' ', 'T')).replace(tzinfo=dt.timezone(dt.timedelta(hours=8)))
+              if len(ds) >= 16 else dt.datetime.now(dt.timezone.utc))
+    except Exception:  # noqa
+        ts = dt.datetime.now(dt.timezone.utc)
+    if vol and math.isfinite(vol):
+        vol = round(vol * intraday_volume_factor(ts, 'Asia/Taipei', 540, 810))
     return rows + [dict(date=today, open=g('open'), high=g('high'), low=g('low'), close=c,
                         volume=vol if math.isfinite(vol) else 0)], True
 
@@ -2529,14 +2554,25 @@ def analyze_stock(sid, name, rows, bm, vp_params, extras_data):
     return dict(stockId=sid, name=name, bars=b, row=row, info=info, total=info['dm']['score'], **extras_data)
 
 
+def ensure_flagsets(results):
+    """一次把所有股票的條件算好（向量化），存在 row['_flagset']；之後比對組合只要查集合。
+    舊寫法是每檔、每類清單都重建一次 DataFrame 重算全部條件，1000 檔要 5000 次，摘要表要算 3 分鐘"""
+    todo = [r for r in results if r.get('row') is not None and '_flagset' not in r['row']]
+    if not todo:
+        return
+    F = build_condition_flags(pd.DataFrame([r['row'] for r in todo]))
+    names = list(F.keys())
+    mat = np.column_stack([F[k].to_numpy(dtype=bool) for k in names]) if names else np.zeros((len(todo), 0), bool)
+    for i, r in enumerate(todo):
+        r['row']['_flagset'] = frozenset(names[j] for j in np.flatnonzero(mat[i]))
+
+
 def matched_combos(row, combos):
-    df = pd.DataFrame([row])
-    flags = build_condition_flags(df)
-    out = []
-    for idx, combo in enumerate(combos):
-        if all(c in flags and bool(flags[c].iloc[0]) for c in combo):
-            out.append(idx)
-    return out
+    fs = row.get('_flagset') if isinstance(row, dict) else None
+    if fs is None:
+        flags = build_condition_flags(pd.DataFrame([row]))
+        fs = frozenset(k for k, v in flags.items() if bool(v.iloc[0]))
+    return [idx for idx, combo in enumerate(combos) if all(c in fs for c in combo)]
 
 
 def score_label(t):
@@ -2624,7 +2660,202 @@ def regime_banner(reg):
     return f"🧭 今日大盤狀態：**{nm}**（{desc}）　→　{REGIME_ADVICE[reg]}。摘要表「大盤適用」欄：✅＝這種大盤下回測有效、❌＝回測為負、⚠️＝普通。"
 
 
+# ════════════════════════════════════════════════════════════════════
+#  大盤溫度計（全市場廣度）＋大盤K線位置（2026-10-19）
+#  溫度計：把這次批次分析所有股票的訊號加總成「市場廣度」，跟三年回測每天的廣度分布比較（百分位），
+#          偏熱指標越高越熱、偏冷指標越高越冷，合成 0（極冷）～100（過熱）。三年回測：廣度過熱後
+#          未來20日大盤偏弱、極冷後偏強（反向指標）。需要批次清單夠廣（建議≥150檔，例如全市場／S&P500）。
+#  K線位置：用大盤本身的收盤價判斷「超賣／正常／過熱」：距60日高點回檔≥10%、RSI(14)<35 或均線空頭排列＝超賣；
+#          RSI>65＝過熱。超賣時買進的股票20日勝率明顯較高（主要來自大盤反彈，不是選股能力）。
+#  MKT_CALIB：分位數與各區歷史統計由三年回測算出（K線位置的統計用等權大盤近似）。
+# ════════════════════════════════════════════════════════════════════
+MKT_CALIB = {"Q": {"平均多方力道": [41.81004, 47.37472, 49.17032, 50.17712, 50.86521, 51.33941, 51.85213, 52.2347, 52.66536, 53.05976, 53.55392, 54.1873, 55.17925, 56.00244, 57.06301, 57.76912, 58.58097, 59.50855, 60.47151, 62.44357, 69.05623], "力道≥65比例": [0.02019, 0.09584, 0.14063, 0.16721, 0.18327, 0.19887, 0.21171, 0.22293, 0.23414, 0.24429, 0.2552, 0.26974, 0.28749, 0.31306, 0.34173, 0.35797, 0.37755, 0.39913, 0.43094, 0.48761, 0.67325], "買盤量比例": [0.03962, 0.13312, 0.17955, 0.20354, 0.2159, 0.22857, 0.24039, 0.2511, 0.26586, 0.27847, 0.28989, 0.31479, 0.32804, 0.34432, 0.35704, 0.36903, 0.38611, 0.41019, 0.44006, 0.53452, 0.70706], "多頭排列比例": [0.00269, 0.08024, 0.13075, 0.15731, 0.17567, 0.19429, 0.20871, 0.22538, 0.23934, 0.25572, 0.2678, 0.28338, 0.3008, 0.31966, 0.34411, 0.36726, 0.38978, 0.40705, 0.43262, 0.46508, 0.62158], "近高點比例": [0.00137, 0.0279, 0.03784, 0.04431, 0.04823, 0.05092, 0.05523, 0.05888, 0.0634, 0.06834, 0.07244, 0.07739, 0.08253, 0.09061, 0.10669, 0.12097, 0.14024, 0.15381, 0.17145, 0.18867, 0.2375], "W命中比例": [0.0, 0.00491, 0.00756, 0.00924, 0.01107, 0.0132, 0.01471, 0.01666, 0.01905, 0.02185, 0.02482, 0.02864, 0.03406, 0.04364, 0.05228, 0.06688, 0.07833, 0.08588, 0.12418, 0.13807, 0.25968], "布林低檔比例": [0.00141, 0.02456, 0.04156, 0.05935, 0.07656, 0.08724, 0.09994, 0.11608, 0.1266, 0.13598, 0.15121, 0.17487, 0.19652, 0.21156, 0.23768, 0.26744, 0.30134, 0.35104, 0.42405, 0.52224, 0.98385], "F命中比例": [0.0, 0.01032, 0.01337, 0.01605, 0.01813, 0.02086, 0.02257, 0.02464, 0.02703, 0.02898, 0.03231, 0.03534, 0.03855, 0.04212, 0.04569, 0.04907, 0.05468, 0.0676, 0.07848, 0.10461, 0.43952]}, "HEAT": ["平均多方力道", "力道≥65比例", "買盤量比例", "多頭排列比例", "近高點比例"], "COLD": ["W命中比例", "布林低檔比例", "F命中比例"], "TEMP": {"偏冷": {"days": 237, "mkt20": 1.25, "up": 59.1, "allWin": 48.3, "sWin": 53.4, "sN": 7085}, "中性": {"days": 181, "mkt20": 1.51, "up": 65.2, "allWin": 46.7, "sWin": 54.1, "sN": 7791}, "偏熱": {"days": 191, "mkt20": 0.85, "up": 64.9, "allWin": 45.4, "sWin": 48.2, "sN": 8139}, "過熱": {"days": 50, "mkt20": 0.76, "up": 66.0, "allWin": 45.2, "sWin": 52.5, "sN": 1329}, "極冷": {"days": 38, "mkt20": 5.78, "up": 89.5, "allWin": 65.3, "sWin": 69.7, "sN": 653}}, "KLINE": {"正常": {"days": 392, "mkt20": 0.91, "up": 61.5, "allWin": 45.4, "sWin": 52.1, "sN": 13238}, "過熱": {"days": 131, "mkt20": 0.97, "up": 69.5, "allWin": 44.5, "sWin": 50.9, "sN": 7873}, "超賣": {"days": 115, "mkt20": 3.16, "up": 67.8, "allWin": 56.9, "sWin": 58.5, "sN": 2711}}}
+MKT_FLAG_OF = {'力道≥65比例': '多方力道≥65', '買盤量比例': '漲時量≥跌時量1.5倍(近20日)', '多頭排列比例': '均線多頭排列(5>20>60且站上月線)',
+               '近高點比例': '距52週高點≤5%', '布林低檔比例': '布林通道低檔(≤20%)'}
+MKT_MIN_STOCKS = 150
+TEMP_ZONES = [(25, '極冷'), (45, '偏冷'), (55, '中性'), (75, '偏熱'), (101, '過熱')]
+
+
+def _calib_pct(q, x):
+    """x 在三年回測分布（21個分位數）中的百分位 0～1"""
+    if x is None:
+        return None
+    q = list(q)
+    if all(q[i] < q[i + 1] for i in range(20)):
+        if x <= q[0]:
+            return 0.0
+        if x >= q[-1]:
+            return 1.0
+        for i in range(20):
+            if q[i] <= x <= q[i + 1]:
+                return (i + (x - q[i]) / (q[i + 1] - q[i])) / 20
+    lo = sum(1 for v in q if v < x) / 20
+    hi = sum(1 for v in q if v <= x) / 20
+    return min(1.0, (lo + hi) / 2)
+
+
+def market_temperature(results, K):
+    """回傳 dict(n, temp, zone, comps={名稱:(數值, 百分位)}) ；股票數不足回傳 dict(n, temp=None)"""
+    ensure_flagsets(results)
+    rows = [r['row'] for r in results if r.get('row')]
+    n = len(rows)
+    if n < MKT_MIN_STOCKS:
+        return dict(n=n, temp=None, zone=None, comps={})
+    vals = {'平均多方力道': float(np.mean([r['total'] for r in results if r.get('row')]))}
+    known = set(build_condition_flags(pd.DataFrame(rows)).keys())   # 欄位整欄都空的旗標不存在（跟回測一致）
+    for nm, fl in MKT_FLAG_OF.items():
+        if fl in known:
+            vals[nm] = float(np.mean([fl in rw.get('_flagset', frozenset()) for rw in rows]))
+    vals['W命中比例'] = float(np.mean([bool(matched_combos(rw, K.get('BT_WIN_COMBOS', []))) for rw in rows]))
+    vals['F命中比例'] = float(np.mean([bool(matched_combos(rw, K.get('BT_HOT_COMBOS', []))) for rw in rows]))
+    comps, hp, cp = {}, [], []
+    for side, lst in (('HEAT', hp), ('COLD', cp)):
+        for nm in MKT_CALIB[side]:
+            if nm in vals:
+                p = _calib_pct(MKT_CALIB['Q'][nm], vals[nm])
+                comps[nm] = (vals[nm], p, side)
+                lst.append(p)
+    if not hp or not cp:
+        return dict(n=n, temp=None, zone=None, comps=comps)
+    temp = (np.mean(hp) - np.mean(cp) + 1) / 2 * 100
+    zone = next(z for lim, z in TEMP_ZONES if temp < lim)
+    return dict(n=n, temp=round(float(temp), 1), zone=zone, comps=comps)
+
+
+def market_kline_position(closes):
+    """大盤收盤價序列 → dict(zone, dd60, rsi, ma) ；資料不足回傳 None"""
+    c = [float(x) for x in (closes or []) if x is not None]
+    if len(c) < 61:
+        return None
+    ma = lambda n: sum(c[-n:]) / n
+    ma5, ma20, ma60 = ma(5), ma(20), ma(60)
+    dd60 = c[-1] / max(c[-60:]) - 1
+    up = dn = None
+    for i in range(1, len(c)):   # Wilder RSI(14)，用 EWM(alpha=1/14) 逐步算（跟回測一致）
+        d = c[i] - c[i - 1]
+        u, w = max(d, 0.0), max(-d, 0.0)
+        up = u if up is None else up + (u - up) / 14
+        dn = w if dn is None else dn + (w - dn) / 14
+    rsi = 100.0 if not dn else 100 - 100 / (1 + up / dn)
+    bear = ma5 < ma20 < ma60 and c[-1] < ma20
+    bull = ma5 > ma20 > ma60 and c[-1] > ma20
+    zone = '超賣' if (dd60 <= -0.10 or rsi < 35 or bear) else ('過熱' if rsi > 65 else '正常')
+    return dict(zone=zone, dd60=round(dd60 * 100, 2), rsi=round(rsi, 1), ma='多頭排列' if bull else ('空頭排列' if bear else '糾結'))
+
+
+def _zone_hist(kind, zone):
+    s = MKT_CALIB[kind].get(zone)
+    if not s:
+        return ''
+    return (f"歷史上未來20日等權大盤平均 {s['mkt20']:+.2f}%、上漲機率 {s['up']:.0f}%"
+            + (f"、S選股型20日勝率 {s['sWin']:.1f}%" if s.get('sWin') is not None else '') + f"（{s['days']}天）")
+
+
+def market_panel_lines(results, K):
+    """批次分析摘要上方的大盤溫度計＋K線位置說明（文字列）"""
+    lines = []
+    bm = next((r.get('bm_close') for r in results if r.get('bm_close')), None)
+    kp = market_kline_position(bm)
+    mt = market_temperature(results, K)
+    if mt['temp'] is not None:
+        lines.append(f"🌡️ 大盤溫度計：**{mt['temp']:.0f}（{mt['zone']}）**，由 {mt['n']} 檔股票的訊號廣度算出 → {_zone_hist('TEMP', mt['zone'])}")
+    else:
+        lines.append(f"🌡️ 大盤溫度計：這次只分析 {mt['n']} 檔，少於 {MKT_MIN_STOCKS} 檔無法代表全市場（請用全市場／S&P500 等大清單）")
+    if kp:
+        lines.append(f"📉 大盤K線位置：**{kp['zone']}**（距60日高 {kp['dd60']:+.1f}%、RSI {kp['rsi']:.0f}、均線{kp['ma']}）→ {_zone_hist('KLINE', kp['zone'])}")
+    hot = (mt['zone'] in ('偏熱', '過熱')) + (kp is not None and kp['zone'] == '過熱')
+    cold = (mt['zone'] in ('極冷', '偏冷')) + (kp is not None and kp['zone'] == '超賣')
+    if cold == 2:
+        lines.append('🟢 溫度計與K線都偏冷／超賣：歷史上之後反彈機率高，可提高部位，S選股型與W擇時型都適用')
+    elif hot == 2:
+        lines.append('🔴 溫度計與K線都偏熱／過熱：歷史上之後一個月偏弱，宜減碼、偏重穩健型組合')
+    elif mt['zone'] or kp:
+        lines.append('⚪ 訊號中性或不一致：維持正常部位，依「大盤適用」欄挑組合')
+    return lines, mt, kp
+
+
+MKT_POS_TEMP = {'極冷': 2, '偏冷': 1, '中性': 0, '偏熱': -1, '過熱': -2}
+MKT_POS_KLINE = {'超賣': 2, '正常': 0, '過熱': -2}
+MKT_POS_MAP = {4: (90, '大幅加碼'), 3: (80, '加碼'), 2: (70, '加碼'), 1: (60, '小幅加碼'), 0: (50, '維持'),
+               -1: (40, '小幅減碼'), -2: (30, '減碼'), -3: (20, '減碼'), -4: (10, '大幅減碼')}
+
+
+def market_position(mt, kp):
+    """溫度計＋K線位置 → (建議持股%, 加減碼, 分數, 說明)；中性＝50%"""
+    parts, sc = [], 0
+    if mt and mt.get('zone'):
+        v = MKT_POS_TEMP[mt['zone']]; sc += v; parts.append(f"溫度計{mt['zone']} {v:+d}")
+    if kp:
+        v = MKT_POS_KLINE[kp['zone']]; sc += v; parts.append(f"K線{kp['zone']} {v:+d}")
+    if not parts:
+        return None
+    pct, act = MKT_POS_MAP[max(-4, min(4, sc))]
+    return pct, act, sc, '、'.join(parts)
+
+
+def market_guide_lines(mt, kp):
+    """大盤指引：把溫度計＋K線位置翻成白話（判定理由、操作建議、接下來要觀察什麼）"""
+    out = []
+    ps = market_position(mt, kp)
+    if ps:
+        out.append(f"・**建議持股 {ps[0]}%（{ps[1]}）**　分數 {ps[2]:+d}（{ps[3]}；中性＝50%，每 ±1 分調 10%）"
+                   + ('' if (mt and mt.get('zone')) else '　⚠️ 溫度計樣本不足，只依K線判斷'))
+    if kp:
+        dd, rsi, ma = kp['dd60'], kp['rsi'], kp['ma']
+        why = [f"距60日高 {dd:+.1f}%（{'已達' if dd <= -10 else '未達'} -10% 超賣門檻）",
+               f"RSI {rsi:.0f}（{'<35 超賣' if rsi < 35 else '>65 過熱' if rsi > 65 else '介於35～65'}）",
+               f"均線{ma}" + ('（空頭排列＝超賣條件）' if ma == '空頭排列' else '')]
+        mean = {'正常': '不在超賣也不在過熱，沒有明顯方向優勢，歷史統計大致等於平常水準',
+                '超賣': '已進入超賣區，歷史上之後20日反彈機率高，是較好的進場區',
+                '過熱': 'RSI 過熱，歷史上之後一個月大盤平均偏弱，追高風險較大'}[kp['zone']]
+        out.append(f"・K線位置「{kp['zone']}」：" + '、'.join(why) + ' → ' + mean)
+    if mt and mt.get('zone'):
+        z = mt['zone']
+        mean = {'極冷': '多數個股弱勢、低檔訊號多，歷史上是之後報酬最好的區間',
+                '偏冷': '整體偏弱、略偏低檔，歷史上之後報酬略優於平常',
+                '中性': '多空力道均衡',
+                '偏熱': '多數個股已走強，之後報酬略低於平常',
+                '過熱': '廣度過熱、強勢股比例偏高，歷史上之後報酬最差'}[z]
+        out.append(f"・溫度計「{z}」：{mean}")
+    tz = mt.get('zone') if mt else None
+    kz = kp['zone'] if kp else None
+    cold_t, hot_t = tz in ('極冷', '偏冷'), tz in ('偏熱', '過熱')
+    if kz == '超賣' and cold_t:
+        act = '兩者都在低檔：較好的進場區，可提高部位，S選股型與W擇時型都適用'
+    elif kz == '過熱' and hot_t:
+        act = '兩者都過熱：宜減碼，新部位偏重S選股型中「大盤適用✅」的組合'
+    elif kz == '超賣':
+        act = 'K線超賣但廣度未冷：可能是少數權值股拖累，分批試單，等溫度計轉冷再加碼'
+    elif kz == '過熱':
+        act = 'K線過熱但廣度未熱：指數靠少數權值股撐盤，個股不宜追高'
+    elif cold_t:
+        act = '整理中、略偏低檔：部位可略高於中性，照常使用S選股型組合'
+    elif hot_t:
+        act = '指數不過熱但個股廣度偏熱：照常操作，留意K線RSI是否轉過熱'
+    else:
+        act = '中性：維持正常部位，依「大盤適用」欄挑組合'
+    out.append('・操作建議：' + act)
+    if kp:
+        w = []
+        if kp['zone'] != '超賣':
+            need = (0.9 / (1 + kp['dd60'] / 100) - 1) * 100
+            w.append(f"指數再跌約 {abs(need):.1f}%（距60日高達-10%）或 RSI 跌破35 → 轉「超賣」")
+        if kp['zone'] != '過熱':
+            w.append('RSI 升破65 → 轉「過熱」')
+        if kp['ma'] == '糾結':
+            w.append('均線糾結待選邊：站穩20MA轉多頭排列偏多；跌破並形成空頭排列即轉超賣訊號')
+        elif kp['ma'] == '多頭排列':
+            w.append('均線多頭排列：跌破20MA才需轉保守')
+        else:
+            w.append('均線空頭排列：重新站回20MA才算止跌')
+        if kp['zone'] != '超賣' and not cold_t:
+            w.append('最佳時機＝K線「超賣」且溫度計同時「偏冷／極冷」')
+        out.append('・接下來觀察：' + '；'.join(w))
+    return out
+
+
 def summary_frame(results, extras_flags, K, live=None):
+    ensure_flagsets(results)
     recs = []
     for r in results:
         b, info = r['bars'], r['info']
@@ -3070,6 +3301,10 @@ def batch_analyze(stocks, token, days, use_rt, ex_flags, vpp, delay=0.6, log=Non
         if i < len(stocks) - 1 and delay:
             time.sleep(delay)
     results.sort(key=lambda r: -r['total'])
+    _bmc = list(bm.close) if bm is not None and getattr(bm, 'close', None) else None
+    for r in results:
+        r['bm_close'] = _bmc   # 大盤K線位置用（同一份清單，不重複佔記憶體）
+    ensure_flagsets(results)
     return results
 
 
@@ -3080,7 +3315,18 @@ def batch_analyze(stocks, token, days, use_rt, ex_flags, vpp, delay=0.6, log=Non
 #  實際表現，並依組合彙總「實盤」勝率，跟回測記錄的勝率對照。
 # ════════════════════════════════════════════════════════════════════
 HIT_LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'combo_hits_log.csv')
-HIT_COLS = ['日期', '股票代號', '股票名', '股價', '漲跌%', '命中組合', '勝率', '飆股比例', 't值', '命中編號']
+HIT_COLS = ['日期', '股票代號', '股票名', '股價', '漲跌%', '命中組合', '勝率', '飆股比例', 't值', '命中編號', '盤中']
+
+
+def is_intraday_hit(rec):
+    """盤中（即時資料）加入追蹤的命中：2026-10-19 前盤中成交量沒換算成全天量，容易誤判『地量』；
+    舊紀錄沒有『盤中』欄位，就把含『地量』條件的命中視為疑似盤中假訊號"""
+    v = rec.get('盤中')
+    if isinstance(v, str) and v:
+        return v == '是'
+    if v is None or (isinstance(v, float) and v != v):
+        return '地量' in str(rec.get('命中組合') or '')
+    return False
 
 
 # ── 每個組合的勝率／飆股比例／t值(同日調整) ──
@@ -3171,6 +3417,7 @@ def best_t(st_):
 def hit_records(results, K, live=None):
     """批次分析結果中有命中指定組合的股票（欄位：日期/代號/名稱/股價/漲跌%/命中組合/勝率/飆股比例/t值）
     「勝率／飆股比例／t值」每一行對應「命中組合」的同一行。"""
+    ensure_flagsets(results)
     out = []
     for r in results:
         mp = matched_combos(r['row'], K['PINNED_COMBOS'])
@@ -3211,13 +3458,13 @@ def hit_records(results, K, live=None):
         out.append({'日期': b.date[e], '股票代號': r['stockId'], '股票名': r['name'], '股價': round(b.close[e], 2),
                     '漲跌%': round((b.close[e] - pc) / pc * 100, 2) if pc else None,
                     '命中組合': '\n'.join(lines), '勝率': '\n'.join(wins), '飆股比例': '\n'.join(moons),
-                    't值': '\n'.join(ts), '命中編號': ' '.join(codes)})
+                    't值': '\n'.join(ts), '命中編號': ' '.join(codes), '盤中': '是' if r.get('realtime') else ''})
     return out
 
 
 def hits_excel_bytes(recs, sheet='命中組合股票'):
     df = pd.DataFrame(recs, columns=HIT_COLS)
-    return sheets_to_xlsx([(sheet, df)], widths=[12, 10, 12, 10, 9, 80, 26, 26, 26, 22], wrap=True)
+    return sheets_to_xlsx([(sheet, df)], widths=[12, 10, 12, 10, 9, 80, 26, 26, 26, 22, 6], wrap=True)
 
 
 def load_hit_log():
@@ -3264,7 +3511,7 @@ def track_performance(log_df, token, delay=0.3, progress=None):
     for r in log_df.to_dict('records'):
         rows = px.get(r['股票代號']) or []
         dates = [x['date'] for x in rows]
-        rec = {k: r.get(k) for k in ('日期', '股票代號', '股票名', '股價', '命中編號', '命中組合')}
+        rec = {k: r.get(k) for k in ('日期', '股票代號', '股票名', '股價', '命中編號', '命中組合', '盤中')}
         import bisect
         k = bisect.bisect_right(dates, str(r['日期'])) - 1   # 命中日（或之前最近的交易日）
         if k < 0:
@@ -3377,6 +3624,9 @@ def run_daily(argv):
     _reg = batch_market_regime(results)
     if _reg:
         print(regime_banner(_reg).replace('**', ''))
+    _ml, _mt, _kp = market_panel_lines(results, K)
+    for _ln in _ml + ['📋 大盤指引'] + market_guide_lines(_mt, _kp):
+        print(_ln.replace('**', ''))
     recs = hit_records(results, K)
     added = append_hit_log(recs)
     print(f'📌 今日命中 {len(recs)} 檔，新增 {added} 筆追蹤紀錄 → {HIT_LOG_FILE}')
@@ -3673,6 +3923,10 @@ def render_batch(st, ss, K):
     _reg = batch_market_regime(results)
     if _reg:
         (st.warning if _reg == 2 else st.info)(regime_banner(_reg))
+    _ml, _mt, _kp = market_panel_lines(results, K)
+    (st.success if _ml[-1].startswith('🟢') else st.error if _ml[-1].startswith('🔴') else st.info)('\n\n'.join(_ml))
+    with st.expander('📋 大盤指引（白話解讀與觀察重點）', expanded=True):
+        st.markdown('\n\n'.join(market_guide_lines(_mt, _kp)))
 
     with st.expander(f"「指定組合命中」編號對照：[選股型] S1~S{len(K['STOCK_PICK_COMBOS'])}　／　[高勝率] #1~#{len(K['PINNED_COMBOS'])}　／　[高標股] M1~M{len(K['MOONSHOT_COMBOS'])}"):
         st.caption('S＝選股型：2023-10～2026-09 三年回測分三段（偏多／空頭／多頭），每一段扣掉同一天大盤後都仍有超額報酬（t≥2），最值得看。'
@@ -3962,7 +4216,12 @@ def render_tracking(st, ss, K):
         st.markdown('##### 🧾 追蹤明細')
         st.dataframe(view, hide_index=True, use_container_width=True, height=380)
         st.markdown('##### 🧩 組合實盤表現（命中後實際報酬 vs 回測記錄）')
-        summ = combo_track_summary(perf, K)
+        ex_intra = st.checkbox('組合彙總排除盤中命中（舊紀錄：含「地量」的命中視為疑似盤中假訊號）', True, key='track_ex_intra',
+                               help='2026-10-19 以前，盤中加入追蹤時成交量沒換算成全天量，很多股票被誤判成「地量」；排除後的組合表現較接近實際')
+        perf_s = perf[~perf.apply(lambda r: is_intraday_hit(r.to_dict()), axis=1)] if ex_intra else perf
+        summ = combo_track_summary(perf_s, K)
+        if ex_intra:
+            st.caption(f'已排除 {len(perf) - len(perf_s)} 筆盤中／疑似盤中假訊號命中（追蹤明細仍全部顯示）')
         st.caption('實盤勝率明顯低於回測記錄的組合，代表可能是過度適配，可考慮從指定組合移除；樣本少於10筆前先別下結論。')
         st.dataframe(summ, hide_index=True, use_container_width=True, height=380)
         st.download_button('📥 匯出追蹤報表', sheets_to_xlsx([('命中紀錄', log), ('追蹤明細', perf), ('組合彙總', summ)]), file_name=f'命中追蹤_{dt.date.today()}.xlsx', key='dl_track')
