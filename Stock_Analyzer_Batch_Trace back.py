@@ -3645,14 +3645,33 @@ def run_daily(argv):
 LISTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'stock_lists.json')
 
 
+# 自訂清單：我的清單＋三種組合型態清單（可從批次分析摘要一鍵加入）＋我的清單4
+STYLE_LISTS = [('進攻', '進攻組合型態'), ('穩健', '穩健組合型態'), ('彩券', '彩券組合型態')]
+CUSTOM_SLOTS = ['我的清單'] + [n for _, n in STYLE_LISTS] + ['我的清單4']
+LIST_RENAME = {'我的清單1': '進攻組合型態', '我的清單2': '穩健組合型態', '我的清單3': '彩券組合型態'}
+
+
+def add_to_custom_list(lists, name, ids):
+    """把 ids 加進清單（保留原有、去重）→ 回傳新增檔數"""
+    cur = list(lists.get(name, []))
+    new = [x for x in dict.fromkeys(str(i) for i in ids) if x not in cur]
+    lists[name] = cur + new
+    return len(new)
+
+
 def load_custom_lists(K):
     try:
         with open(LISTS_FILE, 'r', encoding='utf-8') as f:
             d = json.load(f)
     except Exception:  # noqa
         d = {}
+    for o, n in LIST_RENAME.items():   # 舊版「我的清單1/2/3」→ 改名為三種組合型態清單（內容保留）
+        if o in d:
+            v = d.pop(o)
+            if not d.get(n):
+                d[n] = v
     d.setdefault('我的清單', K['MY_LIST_DEFAULT'])
-    for k in ('我的清單1', '我的清單2', '我的清單3'):
+    for k in CUSTOM_SLOTS[1:]:
         d.setdefault(k, [])
     return d
 
@@ -3729,12 +3748,12 @@ def main():
         st.markdown('### 📊 技術分析全攻略')
         st.caption('朱家泓方法論 · 個股評分系統（POC 分價量表版）')
         st.text_input('FinMind API Token', type='password', key='token')
-        lst_names = ['上市清單', '上櫃清單', '0050成分股', '我的清單', '我的清單1', '我的清單2', '我的清單3']
+        lst_names = ['上市清單', '上櫃清單', '0050成分股', *CUSTOM_SLOTS]
         st.selectbox('載入股票清單', lst_names, key='list_choice', on_change=list_choice_changed,
-                     format_func=lambda k: k + (f"({len(ss['lists'].get(k, []))})" if k.startswith('我的') else ''))
+                     format_func=lambda k: k + (f"({len(ss['lists'].get(k, []))})" if k in CUSTOM_SLOTS else ''))
         st.text_area('批次股票代號（每行一個或逗號分隔）', key='stocks_text', height=140)
         c1, c2 = st.columns(2)
-        save_to = c1.selectbox('存到', ['我的清單', '我的清單1', '我的清單2', '我的清單3'], label_visibility='collapsed', key='save_to')
+        save_to = c1.selectbox('存到', [*CUSTOM_SLOTS], label_visibility='collapsed', key='save_to')
         if c2.button('💾 儲存清單', use_container_width=True):
             stocks = parse_stocks(ss['stocks_text'])
             if stocks:
@@ -3927,6 +3946,15 @@ def render_batch(st, ss, K):
     (st.success if _ml[-1].startswith('🟢') else st.error if _ml[-1].startswith('🔴') else st.info)('\n\n'.join(_ml))
     with st.expander('📋 大盤指引（白話解讀與觀察重點）', expanded=True):
         st.markdown('\n\n'.join(market_guide_lines(_mt, _kp)))
+    if '組合型態' in df.columns and len(df):
+        _bc = st.columns(len(STYLE_LISTS))
+        for (_sty, _ln), _c in zip(STYLE_LISTS, _bc):
+            _ids = [str(x) for x in df.loc[df['組合型態'] == COMBO_STYLE_ICON[_sty], '股票']]
+            if _c.button(f"{COMBO_STYLE_ICON[_sty]} 一鍵加入「{_ln}」（{len(_ids)}檔）", key=f'add_style_{_sty}',
+                         disabled=not _ids, use_container_width=True):
+                _n = add_to_custom_list(ss['lists'], _ln, _ids)
+                save_custom_lists(ss['lists'])
+                st.success(f"✅ 已加入「{_ln}」：新增 {_n} 檔（重複的略過），清單共 {len(ss['lists'][_ln])} 檔")
 
     with st.expander(f"「指定組合命中」編號對照：[選股型] S1~S{len(K['STOCK_PICK_COMBOS'])}　／　[高勝率] #1~#{len(K['PINNED_COMBOS'])}　／　[高標股] M1~M{len(K['MOONSHOT_COMBOS'])}"):
         st.caption('S＝選股型：2023-10～2026-09 三年回測分三段（偏多／空頭／多頭），每一段扣掉同一天大盤後都仍有超額報酬（t≥2），最值得看。'
